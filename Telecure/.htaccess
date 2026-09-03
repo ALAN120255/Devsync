@@ -1,0 +1,50 @@
+# TeleCure - Apache .htaccess
+# Compatible with WAMP/XAMPP Apache 2.4 + PHP 7.x
+
+# Disable directory listing
+Options -Indexes
+
+# ── Security Headers (only if mod_headers is enabled) ────────────────
+<IfModule mod_headers.c>
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-XSS-Protection "1; mode=block"
+</IfModule>
+
+# ── Block direct access to sensitive files ───────────────────────────
+<FilesMatch "\.(sql|log|sh|bak|env)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ── Protect the includes folder ──────────────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /telecure/
+    RewriteRule ^includes/ - [F,L]
+    RewriteRule ^api/config - [F,L]
+</IfModule>
+
+# ── Browser caching for static assets ───────────────────────────────
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css              "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType image/png             "access plus 1 month"
+    ExpiresByType image/jpeg            "access plus 1 month"
+    ExpiresByType image/gif             "access plus 1 month"
+    ExpiresByType image/svg+xml         "access plus 1 month"
+</IfModule>
+
+# ── Gzip compression ────────────────────────────────────────────────
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/plain text/css application/javascript application/json
+</IfModule>
+
+# ── Custom error pages ───────────────────────────────────────────────
+ErrorDocument 404 /telecure/404.php
