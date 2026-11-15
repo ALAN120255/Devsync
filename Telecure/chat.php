@@ -9,16 +9,19 @@ $role = $user['role'];
 // Handle AJAX message send
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_send'])) {
     header('Content-Type: application/json');
+    requireCsrf(true);
     $to      = (int)($_POST['receiver_id'] ?? 0);
     $message = trim($_POST['message'] ?? '');
-    
-    if ($to && !empty($message)) {
+    if (mb_strlen($message) > 2000) $message = mb_substr($message, 0, 2000);
+
+    // Only patient <-> doctor conversations between active accounts are allowed.
+    if ($to && $message !== '' && canMessage($db, $user['id'], $to)) {
         $stmt = $db->prepare("INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)");
         $stmt->execute([$user['id'], $to, $message]);
         $msgId = $db->lastInsertId();
         
         // Send notification
-        addNotification($to, 'New message from ' . $user['full_name'], substr($message, 0, 100), 'message');
+        addNotification($to, 'New message from ' . $user['full_name'], mb_substr($message, 0, 100), 'message');
         
         echo json_encode([
             'success' => true,
@@ -45,7 +48,7 @@ if (isset($_GET['fetch_messages'])) {
         JOIN users u ON m.sender_id = u.id
         WHERE ((m.sender_id=? AND m.receiver_id=?) OR (m.sender_id=? AND m.receiver_id=?))
         AND m.id > ?
-        ORDER BY m.created_at ASC");
+        ORDER BY m.id ASC");
     $stmt->execute([$user['id'], $with, $with, $user['id'], $lastId]);
     echo json_encode($stmt->fetchAll());
     exit;
@@ -83,6 +86,11 @@ if ($activeChatId) {
     $stmt = $db->prepare("SELECT u.*, dp.specialization FROM users u LEFT JOIN doctor_profiles dp ON u.id = dp.user_id WHERE u.id = ?");
     $stmt->execute([$activeChatId]);
     $activeChatUser = $stmt->fetch();
+    // Unknown user, disabled account, or same-role user: don't open a chat.
+    if (!$activeChatUser || !canMessage($db, $user['id'], $activeChatId)) {
+        header('Location: chat.php');
+        exit;
+    }
     
     // Mark messages as read
     $db->prepare("UPDATE messages SET is_read=1 WHERE receiver_id=? AND sender_id=?")->execute([$user['id'], $activeChatId]);
@@ -91,7 +99,7 @@ if ($activeChatId) {
     $msgStmt = $db->prepare("SELECT m.*, u.full_name as sender_name FROM messages m 
         JOIN users u ON m.sender_id = u.id
         WHERE (m.sender_id=? AND m.receiver_id=?) OR (m.sender_id=? AND m.receiver_id=?)
-        ORDER BY m.created_at ASC LIMIT 100");
+        ORDER BY m.id ASC LIMIT 200");
     $msgStmt->execute([$user['id'], $activeChatId, $activeChatId, $user['id']]);
     $messages = $msgStmt->fetchAll();
 }
@@ -147,7 +155,7 @@ if ($activeChatId) {
                             <small><?= $cu['last_time'] ? date('g:i A', strtotime($cu['last_time'])) : '' ?></small>
                         </div>
                         <div class="chat-item-bottom">
-                            <p><?= htmlspecialchars(substr($cu['last_message'] ?? '', 0, 35)) ?>...</p>
+                            <p><?= htmlspecialchars(mb_strlen($cu['last_message'] ?? '') > 35 ? mb_substr($cu['last_message'], 0, 35) . '...' : ($cu['last_message'] ?? '')) ?></p>
                             <?php if ($cu['unread_count'] > 0): ?>
                             <span class="unread-count"><?= $cu['unread_count'] ?></span>
                             <?php endif; ?>
@@ -173,12 +181,11 @@ if ($activeChatId) {
                     <a href="video.php?user=<?= $activeChatId ?>" class="btn-icon-round" title="Video Call">
                         <i class="fas fa-video"></i>
                     </a>
-                    <a href="appointments.php?doctor=<?= $activeChatId ?>" class="btn-icon-round" title="Book Appointment">
+                    <?php if ($role === 'patient'): ?>
+                    <a href="appointments.php?action=book&doctor=<?= (int)$activeChatId ?>" class="btn-icon-round" title="Book Appointment">
                         <i class="fas fa-calendar-plus"></i>
                     </a>
-                    <button class="btn-icon-round" title="More Options">
-                        <i class="fas fa-ellipsis-v"></i>
-                    </button>
+                    <?php endif; ?>
                 </div>
             </div>
 
@@ -195,7 +202,7 @@ if ($activeChatId) {
                     <span><?= date('l, M j', strtotime($msgDate)) ?></span>
                 </div>
                 <?php endif; ?>
-                <div class="message-wrap <?= $isMe ? 'sent' : 'received' ?>">
+                <div class="message-wrap <?= $isMe ? 'sent' : 'received' ?>" data-id="<?= (int)$msg['id'] ?>">
                     <?php if (!$isMe): ?>
                     <img src="<?= avatarUrl($activeChatUser, 32) ?>" class="msg-avatar" alt="">
                     <?php endif; ?>
@@ -214,19 +221,15 @@ if ($activeChatId) {
                         <img src="<?= avatarUrl($activeChatUser, 80) ?>" alt="">
                     </div>
                     <h4><?= htmlspecialchars($activeChatUser['full_name']) ?></h4>
-                    <p>Start your conversation. All messages are encrypted and private.</p>
+                    <p>Start your conversation. Only you and this person can see these messages.</p>
                 </div>
                 <?php endif; ?>
             </div>
 
             <div class="chat-input-area">
-                <button class="chat-attach-btn" title="Attach File">
-                    <i class="fas fa-paperclip"></i>
-                </button>
                 <div class="chat-input-wrap">
                     <textarea id="messageInput" placeholder="Type a message..." rows="1" onkeydown="handleChatKey(event)"></textarea>
                 </div>
-                <button class="chat-emoji-btn"><i class="fas fa-smile"></i></button>
                 <button class="chat-send-btn" id="sendBtn" onclick="sendMessage()">
                     <i class="fas fa-paper-plane"></i>
                 </button>
@@ -280,7 +283,8 @@ if ($activeChatId) {
 </div>
 
 <script>
-const CURRENT_USER_ID = <?= $user['id'] ?>;
+const CURRENT_USER_ID = <?= (int)$user['id'] ?>;
+const CSRF_TOKEN = <?= json_encode(csrf_token()) ?>;
 const CHAT_WITH_ID = <?= $activeChatId ?: 0 ?>;
 let lastMessageId = <?= !empty($messages) ? end($messages)['id'] : 0 ?>;
 
@@ -295,19 +299,26 @@ function sendMessage() {
     fetch('chat.php', {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: `ajax_send=1&receiver_id=${CHAT_WITH_ID}&message=${encodeURIComponent(msg)}`
+        body: `ajax_send=1&csrf_token=${encodeURIComponent(CSRF_TOKEN)}&receiver_id=${CHAT_WITH_ID}&message=${encodeURIComponent(msg)}`
     })
     .then(r => r.json())
     .then(data => {
         if (data.success) {
             appendMessage(msg, true, data.time, data.id);
-            lastMessageId = data.id;
+            lastMessageId = Math.max(lastMessageId, parseInt(data.id, 10));
+        } else {
+            input.value = msg; // restore the text so it isn't lost
+            alert(data.error || 'Message could not be sent.');
         }
-    });
+    })
+    .catch(() => { input.value = msg; alert('Network error - message not sent.'); });
 }
 
 function appendMessage(text, isMine, time, id) {
     const container = document.getElementById('chatMessages');
+    if (container.querySelector('[data-id="' + id + '"]')) return; // already shown
+    const empty = container.querySelector('.chat-empty-start');
+    if (empty) empty.remove();
     const div = document.createElement('div');
     div.className = `message-wrap ${isMine ? 'sent' : 'received'}`;
     div.setAttribute('data-id', id);
@@ -361,11 +372,13 @@ if (CHAT_WITH_ID) {
         fetch(`chat.php?fetch_messages=1&with=${CHAT_WITH_ID}&last_id=${lastMessageId}`)
         .then(r => r.json())
         .then(msgs => {
+            if (!Array.isArray(msgs)) return;
             msgs.forEach(m => {
-                if (m.sender_id != CURRENT_USER_ID) {
-                    appendMessage(m.message, false, new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}), m.id);
-                    lastMessageId = m.id;
-                }
+                // Show every new message once (including ones I sent from another tab/device)
+                // and always advance lastMessageId so nothing is skipped or repeated.
+                appendMessage(m.message, m.sender_id == CURRENT_USER_ID,
+                    new Date(m.created_at.replace(' ', 'T')).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}), m.id);
+                lastMessageId = Math.max(lastMessageId, parseInt(m.id, 10));
             });
         });
     }, 3000);

@@ -1,4 +1,10 @@
 <?php
+// Time zone used for ALL dates/times (appointment slots, "is this slot in the past?", e-mail expiry...).
+// Without this PHP uses whatever php.ini says (often UTC or Europe/Berlin on WAMP) and the
+// appointment times no longer match the clock on the wall. Change it if you are not in South Africa:
+// https://www.php.net/manual/en/timezones.php
+if (!defined('APP_TIMEZONE')) define('APP_TIMEZONE', 'Africa/Johannesburg');
+date_default_timezone_set(APP_TIMEZONE);
 // TeleCure - Database Configuration
 // Place this file in includes/config.php
 
@@ -7,7 +13,21 @@ define('DB_USER', 'root');        // Change to your phpMyAdmin username
 define('DB_PASS', '');            // Change to your phpMyAdmin password
 define('DB_NAME', 'telecure_db');
 define('SITE_NAME', 'TeleCure');
-define('SITE_URL', 'http://localhost/telecure');
+// SITE_URL is detected automatically so the app works in ANY folder name
+// (e.g. /Devsync/Telecure, /telecure, or a virtual host). Override by defining
+// it yourself above this line if you ever need a fixed value.
+if (!defined('SITE_URL')) {
+    $___scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $___host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $___doc    = isset($_SERVER['DOCUMENT_ROOT']) ? realpath($_SERVER['DOCUMENT_ROOT']) : false;
+    $___app    = realpath(__DIR__ . '/..');
+    $___path   = '';
+    if ($___doc && $___app && stripos(str_replace('\\', '/', $___app), str_replace('\\', '/', $___doc)) === 0) {
+        $___path = substr(str_replace('\\', '/', $___app), strlen(str_replace('\\', '/', $___doc)));
+    }
+    define('SITE_URL', $___scheme . '://' . $___host . rtrim($___path, '/'));
+    unset($___scheme, $___host, $___doc, $___app, $___path);
+}
 define('UPLOAD_PATH', __DIR__ . '/../uploads/');
 define('AVATAR_UPLOAD_DIR', UPLOAD_PATH . 'avatars/');
 define('AVATAR_UPLOAD_URL', 'uploads/avatars/');
@@ -26,8 +46,12 @@ function getDB() {
                 PDO::ATTR_EMULATE_PREPARES   => false,
             ];
             $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+            // Make MySQL's NOW()/CURDATE() agree with PHP's clock (same UTC offset, e.g. +02:00).
+            $pdo->exec("SET time_zone = '" . (new DateTime('now'))->format('P') . "'");
         } catch (PDOException $e) {
-            die(json_encode(['error' => 'Database connection failed: ' . $e->getMessage()]));
+            error_log('TeleCure DB connection failed: ' . $e->getMessage());
+            http_response_code(500);
+            die('Database connection failed. Check DB_HOST / DB_USER / DB_PASS / DB_NAME in includes/config.php and that MySQL is running.');
         }
     }
     return $pdo;
@@ -35,6 +59,13 @@ function getDB() {
 
 // Session start
 if (session_status() === PHP_SESSION_NONE) {
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'httponly' => true,
+        'samesite' => 'Lax',
+        'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+    ]);
     session_start();
 }
 
@@ -58,11 +89,96 @@ function currentUser() {
                           LEFT JOIN doctor_profiles dp ON u.id = dp.user_id 
                           WHERE u.id = ?");
     $stmt->execute([$_SESSION['user_id']]);
-    return $stmt->fetch();
+    $row = $stmt->fetch();
+    if (!$row || (isset($row['is_active']) && !$row['is_active'])) {
+        // Account was deleted or deactivated while logged in.
+        $_SESSION = [];
+        session_destroy();
+        header('Location: ' . SITE_URL . '/login.php');
+        exit;
+    }
+    return $row;
 }
 
+// Cleans INPUT (trim + strip tags). It deliberately does NOT HTML-encode:
+// encoding on the way in AND on the way out turned "O'Brien" into
+// "O&amp;#039;Brien" on screen. Always escape on OUTPUT with e().
 function sanitize($input) {
-    return htmlspecialchars(strip_tags(trim($input)), ENT_QUOTES, 'UTF-8');
+    return trim(strip_tags((string)$input));
+}
+
+// Fallbacks so the app still works if the PHP mbstring extension is not enabled.
+if (!function_exists('mb_strlen')) {
+    function mb_strlen($s, $enc = null) { return preg_match_all('/./us', (string)$s, $m); }
+}
+if (!function_exists('mb_substr')) {
+    function mb_substr($s, $start, $len = null, $enc = null) {
+        preg_match_all('/./us', (string)$s, $m);
+        return implode('', array_slice($m[0], $start, $len));
+    }
+}
+
+// Escape for HTML output.
+function e($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
+
+// ── CSRF protection ─────────────────────────────────────────────────
+function csrf_token() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+function csrf_field() {
+    return '<input type="hidden" name="csrf_token" value="' . e(csrf_token()) . '">';
+}
+function csrf_valid() {
+    $sent = $_POST['csrf_token'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
+    return !empty($_SESSION['csrf_token']) && is_string($sent) && hash_equals($_SESSION['csrf_token'], $sent);
+}
+// Call at the top of any POST handler. Stops the request if the token is bad.
+function requireCsrf($json = false) {
+    if (!csrf_valid()) {
+        http_response_code(419);
+        if ($json) { header('Content-Type: application/json'); die(json_encode(['ok'=>false,'success'=>false,'error'=>'Session expired. Refresh the page.'])); }
+        die('Your session expired or the form was invalid. Please go back, refresh the page and try again.');
+    }
+}
+
+// ── Password policy (single source of truth: register, reset, profile) ──
+// At least 8 characters, at least one number and at least one special character.
+function passwordPolicyError($pw) {
+    $pw = (string)$pw;
+    if (strlen($pw) < 8)                          return 'Password must be at least 8 characters long.';
+    if (!preg_match('/[0-9]/', $pw))              return 'Password must contain at least one number.';
+    if (!preg_match('/[^A-Za-z0-9\s]/', $pw))     return 'Password must contain at least one special character (e.g. ! @ # $ % &).';
+    return null;
+}
+
+function isAdmin($user) {
+    return !empty($user['is_admin']);
+}
+
+// "Dr. Sarah Johnson" stays as is; "Sarah Johnson" becomes "Dr. Sarah Johnson".
+function doctorName($name) {
+    return preg_match('/^dr\.?\s/i', $name) ? $name : 'Dr. ' . $name;
+}
+
+// Single source of truth for bookable time slots (used by booking form + API).
+function appointmentSlots() {
+    return ['08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30','12:00','12:30',
+            '14:00','14:30','15:00','15:30','16:00','16:30','17:00'];
+}
+
+// Chats are only allowed between a patient and a doctor (never self, never a disabled account).
+function canMessage($db, $fromId, $toId) {
+    if (!$toId || $toId == $fromId) return false;
+    $stmt = $db->prepare("SELECT role FROM users WHERE id IN (?, ?) AND is_active = 1");
+    $stmt->execute([$fromId, $toId]);
+    $roles = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    sort($roles);
+    return $roles === ['doctor', 'patient'];
 }
 
 // ── Avatar helpers ──────────────────────────────────────────────────

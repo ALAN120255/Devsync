@@ -521,3 +521,11 @@
   from { opacity: 0; transform: translateY(20px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* Live availability badge (appointments.php / doctor_profile.php) */
+.live-status { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 0.78rem; font-weight: 500; }
+.live-status.on  { color: #059669; }
+.live-status.off { color: #b45309; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
+.live-status.on .live-dot { animation: livePulse 1.6s ease-in-out infinite; }
+@keyframes livePulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }

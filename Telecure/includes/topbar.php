@@ -21,10 +21,12 @@ $notifIconMap = array(
         </div>
     </div>
     <div class="topbar-right">
-        <div class="topbar-search">
+        <?php if ($user['role'] === 'patient'): ?>
+        <form class="topbar-search" method="GET" action="find_doctors.php">
             <i class="fas fa-search"></i>
-            <input type="text" placeholder="Search doctors, appointments...">
-        </div>
+            <input type="text" name="search" placeholder="Search doctors or specialties...">
+        </form>
+        <?php endif; ?>
         <a href="chat.php" class="topbar-icon-btn">
             <i class="fas fa-comments"></i>
             <?php if ($msgCount > 0): ?>

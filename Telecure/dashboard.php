@@ -24,7 +24,7 @@ if ($role === 'patient') {
         FROM appointments a 
         JOIN users u ON a.doctor_id = u.id 
         LEFT JOIN doctor_profiles dp ON u.id = dp.user_id
-        WHERE a.patient_id = ? AND a.status IN ('pending','confirmed') AND a.appointment_date >= CURDATE()
+        WHERE a.patient_id = ? AND a.status IN ('pending','confirmed') AND TIMESTAMP(a.appointment_date, a.appointment_time) >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
         ORDER BY a.appointment_date ASC, a.appointment_time ASC LIMIT 5");
     $upcoming->execute([$user['id']]);
     $upcomingAppts = $upcoming->fetchAll();
@@ -54,30 +54,35 @@ if ($role === 'patient') {
 
     $unreadMsgs = getUnreadMessages($user['id']);
 
-    // Today's appointments
+    // Upcoming appointments (pending/confirmed only - cancelled ones are noise)
     $upcoming = $db->prepare("SELECT a.*, u.full_name as patient_name, u.phone as patient_phone, u.profile_photo as other_photo, u.role as other_role
         FROM appointments a 
         JOIN users u ON a.patient_id = u.id 
-        WHERE a.doctor_id = ? AND a.appointment_date >= CURDATE()
+        WHERE a.doctor_id = ? AND TIMESTAMP(a.appointment_date, a.appointment_time) >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND a.status IN ('pending','confirmed')
         ORDER BY a.appointment_date ASC, a.appointment_time ASC LIMIT 5");
     $upcoming->execute([$user['id']]);
     $upcomingAppts = $upcoming->fetchAll();
 }
 
-// Recent messages (chat list)
+// Recent conversations: ONE row per person (latest message), not one row per message.
 $recentChats = $db->prepare("
-    SELECT DISTINCT
-        CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END as other_user_id,
-        u.full_name, u.role, u.profile_photo,
-        m.message as last_message, m.created_at as last_time,
-        SUM(CASE WHEN m.receiver_id = ? AND m.is_read = 0 THEN 1 ELSE 0 END) as unread_count
-    FROM messages m
-    JOIN users u ON u.id = CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END
-    WHERE m.sender_id = ? OR m.receiver_id = ?
-    GROUP BY other_user_id, u.full_name, u.role, u.profile_photo, m.message, m.created_at
-    ORDER BY m.created_at DESC LIMIT 5
+    SELECT t.other_user_id, u.full_name, u.role, u.profile_photo,
+           m.message AS last_message, m.created_at AS last_time,
+           (SELECT COUNT(*) FROM messages x
+             WHERE x.sender_id = t.other_user_id AND x.receiver_id = ? AND x.is_read = 0) AS unread_count
+    FROM (
+        SELECT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS other_user_id,
+               MAX(id) AS last_id
+        FROM messages
+        WHERE sender_id = ? OR receiver_id = ?
+        GROUP BY other_user_id
+    ) t
+    JOIN messages m ON m.id = t.last_id
+    JOIN users u    ON u.id = t.other_user_id
+    ORDER BY m.id DESC
+    LIMIT 5
 ");
-$recentChats->execute([$user['id'], $user['id'], $user['id'], $user['id'], $user['id']]);
+$recentChats->execute([$user['id'], $user['id'], $user['id'], $user['id']]);
 $chats = $recentChats->fetchAll();
 
 $avatarUrl = avatarUrl($user, 80);
@@ -104,13 +109,20 @@ $avatarUrl = avatarUrl($user, 80);
         <?php if (isset($_GET['welcome'])): ?>
         <div class="welcome-banner">
             <div class="welcome-content">
-                <i class="fas fa-party-horn"></i>
+                <i class="fas fa-champagne-glasses"></i>
                 <div>
                     <h3>Welcome to TeleCure, <?= htmlspecialchars(explode(' ', $user['full_name'])[0]) ?>! 🎉</h3>
                     <p>Your account has been created. Let's get you started!</p>
                 </div>
             </div>
             <button onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>
+        </div>
+        <?php endif; ?>
+
+        <?php if ($role === 'doctor' && empty($user['is_verified'])): ?>
+        <div class="alert alert-error" style="margin-bottom:20px;">
+            <i class="fas fa-hourglass-half"></i>
+            Your doctor account is <strong>awaiting verification</strong>. Patients can't find or book you, and you can't issue prescriptions, until an administrator verifies your licence.
         </div>
         <?php endif; ?>
 
@@ -257,7 +269,7 @@ $avatarUrl = avatarUrl($user, 80);
                         <div class="chat-info">
                             <strong><?= htmlspecialchars($chat['full_name']) ?></strong>
                             <small class="role-tag"><?= ucfirst($chat['role']) ?></small>
-                            <p class="last-msg"><?= htmlspecialchars(substr($chat['last_message'], 0, 40)) ?>...</p>
+                            <p class="last-msg"><?= htmlspecialchars(mb_strlen($chat['last_message']) > 40 ? mb_substr($chat['last_message'], 0, 40) . '...' : $chat['last_message']) ?></p>
                         </div>
                         <div class="chat-meta">
                             <span class="time"><?= date('g:i A', strtotime($chat['last_time'])) ?></span>

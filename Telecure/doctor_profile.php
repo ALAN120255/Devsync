@@ -19,6 +19,8 @@ $stmt = $db->prepare(
 $stmt->execute([$docId]);
 $doc = $stmt->fetch();
 if (!$doc) { header('Location: find_doctors.php'); exit; }
+// Unverified doctors are only visible to themselves and administrators.
+if (!$doc['is_verified'] && $user['id'] != $docId && !isAdmin($user)) { header('Location: find_doctors.php'); exit; }
 
 // Reviews
 $revStmt = $db->prepare(
@@ -40,6 +42,7 @@ if ($user['role'] === 'patient') {
 // Handle review submit
 $reviewMsg = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_review']) && $canReview) {
+    requireCsrf();
     $rating  = min(5, max(1, (int)$_POST['rating']));
     $comment = sanitize($_POST['comment'] ?? '');
     // Upsert: one review per patient per doctor
@@ -242,11 +245,12 @@ $docAvatarUrl = avatarUrl($doc, 120);
                     <div class="form-group">
                         <label>Select a Date</label>
                         <input type="date" id="slotDate" min="<?= date('Y-m-d') ?>" style="max-width:220px;"
-                               onchange="loadSlots(this.value)">
+                               onchange="loadSlots(this.value, false)">
                     </div>
                     <div id="slotContainer" style="display:none;">
                         <p style="font-size:0.85rem;color:var(--text-light);margin-bottom:8px;">Available time slots:</p>
                         <div class="slots-grid" id="slotsGrid"></div>
+                        <small id="liveStatus" class="live-status off"><span class="live-dot"></span> Connecting...</small>
                         <div style="margin-top:16px;" id="bookSlotArea" style="display:none;">
                             <a id="bookSlotBtn" href="#" class="btn-primary" style="display:none;">
                                 <i class="fas fa-calendar-plus"></i> Book This Slot
@@ -285,13 +289,14 @@ $docAvatarUrl = avatarUrl($doc, 120);
 
                 <!-- Reviews -->
                 <div class="doc-main-card">
-                    <h3><i class="fas fa-star"></i> Patient Reviews (<?= count($reviews) ?>)</h3>
+                    <h3 id="reviews"><i class="fas fa-star"></i> Patient Reviews (<?= count($reviews) ?>)</h3>
 
                     <?php if ($canReview): ?>
                     <!-- Write a Review -->
                     <div style="background:var(--primary-pale);border-radius:var(--radius-md);padding:20px;margin-bottom:20px;border:1px solid rgba(21,101,192,0.15);">
                         <h4 style="font-size:0.9rem;color:var(--primary);margin-bottom:12px;"><i class="fas fa-pen"></i> Write a Review</h4>
-                        <form method="POST" action="doctor_profile.php?id=<?= $docId ?>">
+                        <form method="POST" action="doctor_profile.php?id=<?= (int)$docId ?>">
+                        <?= csrf_field() ?>
                             <div class="form-group">
                                 <label>Your Rating</label>
                                 <div class="star-rating">
@@ -350,20 +355,38 @@ $docAvatarUrl = avatarUrl($doc, 120);
 <script>
 var DOC_ID = <?= $docId ?>;
 var selectedTime = null;
+var currentDate = '';
+var slotReq = 0, slotTimer = null;
 
-function loadSlots(date) {
+function setLive(text, ok) {
+    var el = document.getElementById('liveStatus');
+    if (!el) return;
+    el.className = 'live-status ' + (ok ? 'on' : 'off');
+    el.innerHTML = '<span class="live-dot"></span> ' + text;
+}
+
+// silent = background refresh (no spinner, keeps the patient's selection if the slot is still free)
+function loadSlots(date, silent) {
     if (!date) return;
-    document.getElementById('slotContainer').style.display = 'none';
-    document.getElementById('slotsLoading').style.display = 'block';
-    document.getElementById('bookSlotBtn').style.display = 'none';
-    selectedTime = null;
+    if (date !== currentDate) { selectedTime = null; silent = false; }
+    currentDate = date;
+    var myReq = ++slotReq;
+    if (!silent) {
+        document.getElementById('slotContainer').style.display = 'none';
+        document.getElementById('slotsLoading').style.display = 'block';
+        document.getElementById('bookSlotBtn').style.display = 'none';
+    }
 
-    fetch('api/appointments.php?action=slots&doctor_id=' + DOC_ID + '&date=' + date)
+    fetch('api/appointments.php?action=slots&doctor_id=' + DOC_ID + '&date=' + encodeURIComponent(date) + '&_=' + Date.now(), { cache: 'no-store' })
         .then(function(r){ return r.json(); })
-        .then(function(slots) {
+        .then(function(data) {
+            if (myReq !== slotReq) return;
+            var slots = data.slots || [];
             document.getElementById('slotsLoading').style.display = 'none';
             document.getElementById('slotContainer').style.display = 'block';
             var grid = document.getElementById('slotsGrid');
+            var bookBtn = document.getElementById('bookSlotBtn');
+            var stillFree = false, msg = null;
             grid.innerHTML = '';
             slots.forEach(function(s) {
                 var btn = document.createElement('div');
@@ -371,20 +394,37 @@ function loadSlots(date) {
                 btn.textContent = s.label;
                 btn.title = s.available ? 'Click to select' : 'Already booked';
                 if (s.available) {
+                    if (s.time === selectedTime) { btn.classList.add('selected'); stillFree = true; }
                     btn.onclick = function() {
                         document.querySelectorAll('.slot-btn').forEach(function(b){ b.classList.remove('selected'); });
                         btn.classList.add('selected');
                         selectedTime = s.time;
-                        var bookBtn = document.getElementById('bookSlotBtn');
                         bookBtn.style.display = 'inline-flex';
                         bookBtn.href = 'appointments.php?action=book&doctor=' + DOC_ID + '&date=' + date + '&time=' + s.time;
                     };
                 }
                 grid.appendChild(btn);
             });
+            if (selectedTime && !stillFree) {
+                selectedTime = null;
+                bookBtn.style.display = 'none';
+                msg = 'The time you picked was just booked - please choose another';
+            } else if (selectedTime) {
+                bookBtn.style.display = 'inline-flex';
+            }
+            setLive(msg || ('Live &middot; updated ' + (data.now_label || new Date().toLocaleTimeString())), !msg);
         })
-        .catch(function(){ document.getElementById('slotsLoading').style.display = 'none'; });
+        .catch(function(){
+            document.getElementById('slotsLoading').style.display = 'none';
+            setLive('Connection lost - retrying...', false);
+        });
 }
+
+// Re-check every 5 s, and the moment the tab comes back into view.
+function refreshNow() { var d = document.getElementById('slotDate'); if (d && d.value && !document.hidden) loadSlots(d.value, true); }
+slotTimer = setInterval(refreshNow, 5000);
+document.addEventListener('visibilitychange', refreshNow);
+window.addEventListener('focus', refreshNow);
 </script>
 </body>
 </html>

@@ -5,9 +5,11 @@ requireLogin();
 $user = currentUser();
 $db   = getDB();
 
-// Simple admin guard — first registered doctor OR add an 'admin' role in DB
-// For now any doctor can access; real apps would use role='admin'
-if ($user['role'] !== 'doctor') {
+// Admin guard. This used to let ANY doctor in - including a brand-new, unverified
+// self-registered one, who could then verify themselves and disable other accounts.
+// Access now needs users.is_admin = 1 (see migrations/001_fixes.sql).
+if (!isAdmin($user)) {
+    http_response_code(403);
     header('Location: dashboard.php');
     exit;
 }
@@ -21,7 +23,11 @@ $pendingAppts  = $db->query("SELECT COUNT(*) FROM appointments WHERE status='pen
 
 // ── Recent registrations ─────────────────────────────────────────────
 $recentUsers = $db->query(
-    "SELECT id, full_name, email, role, created_at, is_active, profile_photo FROM users ORDER BY created_at DESC LIMIT 15"
+    "SELECT u.id, u.full_name, u.email, u.role, u.created_at, u.is_active, u.profile_photo
+     FROM users u
+     LEFT JOIN doctor_profiles dp ON dp.user_id = u.id
+     ORDER BY (u.role = 'doctor' AND dp.is_verified = 0) DESC, u.created_at DESC
+     LIMIT 50"
 )->fetchAll();
 
 // ── Recent appointments ──────────────────────────────────────────────
@@ -35,16 +41,22 @@ $recentAppts = $db->query(
 
 // ── Toggle user active ───────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_user'])) {
-    $tid    = (int)$_POST['user_id'];
-    $active = (int)$_POST['is_active'];
-    $db->prepare("UPDATE users SET is_active=? WHERE id=?")->execute([$active, $tid]);
+    requireCsrf();
+    $tid    = (int)($_POST['user_id'] ?? 0);
+    $active = empty($_POST['is_active']) ? 0 : 1;
+    if ($tid === (int)$user['id']) {            // never lock yourself out
+        header('Location: admin.php?msg=self');
+        exit;
+    }
+    $db->prepare("UPDATE users SET is_active=? WHERE id=? AND is_admin=0")->execute([$active, $tid]);
     header('Location: admin.php?msg=user_updated');
     exit;
 }
 
 // ── Verify doctor ────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verify_doctor'])) {
-    $did = (int)$_POST['doctor_id'];
+    requireCsrf();
+    $did = (int)($_POST['doctor_id'] ?? 0);
     $db->prepare("UPDATE doctor_profiles SET is_verified=1 WHERE user_id=?")->execute([$did]);
     addNotification($did,'Account Verified','Congratulations! Your doctor account has been verified on TeleCure.','general');
     header('Location: admin.php?msg=verified');
@@ -54,6 +66,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verify_doctor'])) {
 $msgLabels = array(
     'user_updated' => 'User status updated.',
     'verified'     => 'Doctor account verified!',
+    'self'         => 'You cannot deactivate your own account.',
 );
 ?>
 <!DOCTYPE html>
@@ -122,6 +135,7 @@ $msgLabels = array(
                 <h1><i class="fas fa-shield-alt" style="color:var(--primary);font-size:1.4rem;"></i> Admin Panel</h1>
                 <p>Manage users, appointments, and platform activity</p>
             </div>
+            <a href="admin_email.php" class="btn-primary" style="text-decoration:none"><i class="fas fa-envelope-open-text"></i> Email Settings</a>
         </div>
 
         <?php if (isset($_GET['msg']) && isset($msgLabels[$_GET['msg']])): ?>
@@ -191,6 +205,7 @@ $msgLabels = array(
                                 <td>
                                     <?php if ($u['id'] !== $user['id']): ?>
                                     <form class="toggle-form" method="POST" action="admin.php">
+                                        <?= csrf_field() ?>
                                         <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
                                         <input type="hidden" name="is_active" value="<?= $u['is_active'] ? 0 : 1 ?>">
                                         <button type="submit" name="toggle_user" class="<?= $u['is_active'] ? 'btn-deactivate' : 'btn-activate' ?>">
@@ -204,6 +219,7 @@ $msgLabels = array(
                                     $vRow = $isVer->fetch();
                                     if ($vRow && !$vRow['is_verified']): ?>
                                     <form class="toggle-form" method="POST" action="admin.php" style="margin-left:6px;">
+                                        <?= csrf_field() ?>
                                         <input type="hidden" name="doctor_id" value="<?= $u['id'] ?>">
                                         <button type="submit" name="verify_doctor" class="btn-verify">Verify</button>
                                     </form>

@@ -9,17 +9,35 @@ $msg = '';
 
 // Write prescription (doctor only)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['write_prescription']) && $role === 'doctor') {
-    $patientId  = (int)$_POST['patient_id'];
+    requireCsrf();
+    $patientId  = (int)($_POST['patient_id'] ?? 0);
     $apptId     = (int)($_POST['appointment_id'] ?? 0) ?: null;
-    $diagnosis  = sanitize($_POST['diagnosis']);
-    $notes      = sanitize($_POST['notes']);
+    $diagnosis  = sanitize($_POST['diagnosis'] ?? '');
+    $notes      = sanitize($_POST['notes'] ?? '');
     $issuedDate = date('Y-m-d');
 
-    $medications = $_POST['medications'] ?? [];
+    $medications = (isset($_POST['medications']) && is_array($_POST['medications'])) ? $_POST['medications'] : [];
+    $hasMed = false;
+    foreach ($medications as $m) { if (is_array($m) && trim($m['name'] ?? '') !== '') { $hasMed = true; break; } }
 
-    if (!$patientId || empty($medications)) {
-        $msg = '<div class="alert alert-error">Please fill all required fields.</div>';
+    // A doctor may only prescribe for patients they actually have an appointment with,
+    // and only once their licence has been verified.
+    $ok = $db->prepare("SELECT 1 FROM appointments WHERE doctor_id = ? AND patient_id = ? LIMIT 1");
+    $ok->execute([$user['id'], $patientId]);
+    $isMyPatient = (bool)$ok->fetchColumn();
+
+    if (empty($user['is_verified'])) {
+        $msg = '<div class="alert alert-error">Your account must be verified by an administrator before you can issue prescriptions.</div>';
+    } elseif (!$patientId || !$isMyPatient) {
+        $msg = '<div class="alert alert-error">Please choose one of your patients.</div>';
+    } elseif (!$hasMed) {
+        $msg = '<div class="alert alert-error">Add at least one medication.</div>';
     } else {
+        if ($apptId) { // appointment must belong to this doctor + patient
+            $ac = $db->prepare("SELECT id FROM appointments WHERE id = ? AND doctor_id = ? AND patient_id = ?");
+            $ac->execute([$apptId, $user['id'], $patientId]);
+            if (!$ac->fetch()) $apptId = null;
+        }
         $db->beginTransaction();
         try {
             $stmt = $db->prepare("INSERT INTO prescriptions (doctor_id, patient_id, appointment_id, diagnosis, notes, issued_date) VALUES (?, ?, ?, ?, ?, ?)");
@@ -27,14 +45,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['write_prescription'])
             $rxId = $db->lastInsertId();
 
             foreach ($medications as $med) {
-                if (!empty($med['name'])) {
+                if (is_array($med) && trim($med['name'] ?? '') !== '') {
                     $mStmt = $db->prepare("INSERT INTO prescription_medications (prescription_id, medication_name, dosage, frequency, duration, instructions) VALUES (?, ?, ?, ?, ?, ?)");
-                    $mStmt->execute([$rxId, $med['name'], $med['dosage'] ?? '', $med['frequency'] ?? '', $med['duration'] ?? '', $med['instructions'] ?? '']);
+                    $mStmt->execute([$rxId, sanitize($med['name']), sanitize($med['dosage'] ?? ''), sanitize($med['frequency'] ?? ''), sanitize($med['duration'] ?? ''), sanitize($med['instructions'] ?? '')]);
                 }
             }
 
             // Notify patient
-            addNotification($patientId, 'New Prescription', 'Dr. ' . $user['full_name'] . ' has issued you a prescription.', 'prescription');
+            addNotification($patientId, 'New Prescription', doctorName($user['full_name']) . ' has issued you a prescription.', 'prescription');
 
             $db->commit();
             $msg = '<div class="alert alert-success"><i class="fas fa-check-circle"></i> Prescription issued successfully!</div>';
@@ -230,9 +248,9 @@ if ($role === 'doctor') {
                     <i class="fas fa-prescription"></i>
                 </div>
                 <div class="rx-list-info">
-                    <h4><?= $role === 'patient' ? 'Dr. ' . htmlspecialchars($rx['doctor_name']) : htmlspecialchars($rx['patient_name']) ?></h4>
+                    <h4><?= $role === 'patient' ? htmlspecialchars(doctorName($rx['doctor_name'])) : htmlspecialchars($rx['patient_name']) ?></h4>
                     <?php if (isset($rx['specialization'])): ?>
-                    <span class="spec-badge"><?= htmlspecialchars($rx['specialization']) ?></span>
+                    <span class="spec-badge"><?= htmlspecialchars($rx['specialization'] ?? '') ?></span>
                     <?php endif; ?>
                     <p class="rx-diagnosis-preview"><?= htmlspecialchars(substr($rx['diagnosis'] ?? 'General prescription', 0, 60)) ?></p>
                 </div>
@@ -260,6 +278,7 @@ if ($role === 'doctor') {
         </div>
         <div class="modal-body">
             <form method="POST" action="prescriptions.php" id="rxForm">
+                <?= csrf_field() ?>
                 <div class="form-group">
                     <label>Patient</label>
                     <select name="patient_id" required>

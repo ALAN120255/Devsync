@@ -8,6 +8,8 @@ $role = $user['role'];
 
 $roomName = sanitize($_GET['room'] ?? '');
 $appointmentId = (int)($_GET['appointment'] ?? 0);
+$otherUserId = 0;      // who the call is with (used by the in-call mini chat)
+$roomError   = '';
 
 // Get room from appointment
 if ($appointmentId && !$roomName) {
@@ -19,10 +21,60 @@ if ($appointmentId && !$roomName) {
     if ($session) $roomName = $session['room_name'];
 }
 
-// Create ad-hoc room if no appointment
+// Create ad-hoc room from a chat ("video call" button) - only patient <-> doctor
 if (!$roomName && isset($_GET['user'])) {
     $withUserId = (int)$_GET['user'];
-    $roomName = 'telecure-adhoc-' . min($user['id'], $withUserId) . '-' . max($user['id'], $withUserId);
+    if (canMessage($db, $user['id'], $withUserId)) {
+        $roomName = 'telecure-adhoc-' . min($user['id'], $withUserId) . '-' . max($user['id'], $withUserId);
+        $otherUserId = $withUserId;
+    } else {
+        $roomError = 'You can only start a video call with a doctor or patient you are connected with.';
+    }
+}
+
+// ── Authorise the room ───────────────────────────────────────────────
+// Previously ANY logged-in user could open ANY room name via ?room=. Now the
+// room must be (a) one of your appointment rooms, (b) your own ad-hoc room,
+// or (c) an "instant" room (random code you share with the other person).
+if ($roomName && !$roomError) {
+    if (!preg_match('/^[A-Za-z0-9_-]{4,100}$/', $roomName)) {
+        $roomError = 'That room code is not valid.';
+        $roomName = '';
+    } else {
+        $rs = $db->prepare("SELECT a.id, a.patient_id, a.doctor_id FROM video_sessions vs
+                            JOIN appointments a ON a.id = vs.appointment_id
+                            WHERE vs.room_name = ?");
+        $rs->execute([$roomName]);
+        $roomAppt = $rs->fetch();
+
+        if ($roomAppt) {
+            if ($roomAppt['patient_id'] == $user['id'] || $roomAppt['doctor_id'] == $user['id']) {
+                $appointmentId = (int)$roomAppt['id'];
+                $otherUserId = ($roomAppt['patient_id'] == $user['id']) ? (int)$roomAppt['doctor_id'] : (int)$roomAppt['patient_id'];
+            } else {
+                $roomError = 'You are not a participant of this consultation.';
+                $roomName = '';
+            }
+        } elseif (preg_match('/^telecure-adhoc-(\d+)-(\d+)$/', $roomName, $mm)) {
+            if ((int)$mm[1] === (int)$user['id'] || (int)$mm[2] === (int)$user['id']) {
+                $otherUserId = ((int)$mm[1] === (int)$user['id']) ? (int)$mm[2] : (int)$mm[1];
+            } else {
+                $roomError = 'You are not a participant of this call.';
+                $roomName = '';
+            }
+        } elseif (strpos($roomName, 'telecure-instant-') !== 0) {
+            $roomError = 'Unknown room. Use the room code your doctor or patient gave you, or join from your appointments.';
+            $roomName = '';
+        }
+    }
+}
+
+// Only show chat messages sent DURING this call in the mini chat (not the whole history).
+$miniStartId = 0;
+if ($otherUserId) {
+    $ms = $db->prepare("SELECT COALESCE(MAX(id),0) FROM messages WHERE (sender_id=? AND receiver_id=?) OR (sender_id=? AND receiver_id=?)");
+    $ms->execute([$user['id'], $otherUserId, $otherUserId, $user['id']]);
+    $miniStartId = (int)$ms->fetchColumn();
 }
 
 // Get appointment details for context
@@ -82,6 +134,9 @@ $videoApptList = $videoAppts->fetchAll();
             </div>
         </div>
 
+        <?php if ($roomError): ?>
+        <div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> <?= e($roomError) ?></div>
+        <?php endif; ?>
         <div class="video-landing">
             <div class="video-hero-card">
                 <div class="video-hero-icon">
@@ -208,15 +263,16 @@ $videoApptList = $videoAppts->fetchAll();
 
 <script>
 <?php if ($roomName): ?>
+const NOTES_KEY = 'consult_notes_' + <?= json_encode($roomName) ?>;
 const domain = 'meet.jit.si';
 const options = {
-    roomName: '<?= addslashes($roomName) ?>',
+    roomName: <?= json_encode($roomName) ?>,
     width: '100%',
     height: '100%',
     parentNode: document.querySelector('#jitsiContainer'),
     userInfo: {
-        displayName: '<?= addslashes($user['full_name']) ?>',
-        email: '<?= addslashes($user['email']) ?>'
+        displayName: <?= json_encode($user['full_name']) ?>,
+        email: <?= json_encode($user['email']) ?>
     },
     configOverwrite: {
         startWithAudioMuted: false,
@@ -251,10 +307,50 @@ api.addEventListener('videoConferenceLeft', () => {
 
 function saveNotes() {
     const notes = document.getElementById('consultNotes').value;
-    localStorage.setItem('consult_notes_<?= $roomName ?>', notes);
-    alert('Notes saved!');
+    try { localStorage.setItem(NOTES_KEY, notes); alert('Notes saved on this device.'); }
+    catch (e) { alert('Could not save notes in this browser.'); }
 }
-document.getElementById('consultNotes').value = localStorage.getItem('consult_notes_<?= $roomName ?>') || '';
+try { document.getElementById('consultNotes').value = localStorage.getItem(NOTES_KEY) || ''; } catch (e) {}
+
+// ── In-call mini chat (was calling an undefined function before) ─────
+const CSRF_TOKEN   = <?= json_encode(csrf_token()) ?>;
+const OTHER_USER   = <?= (int)$otherUserId ?>;
+const ME           = <?= (int)$user['id'] ?>;
+let miniLast = <?= (int)$miniStartId ?>;
+function miniAppend(text, mine, id) {
+    const box = document.getElementById('miniChat');
+    if (id && box.querySelector('[data-id="' + id + '"]')) return;
+    const d = document.createElement('div');
+    d.className = 'mini-msg ' + (mine ? 'mine' : 'theirs');
+    if (id) d.dataset.id = id;
+    d.textContent = text;                       // textContent => no HTML injection
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+}
+function sendMiniMsg() {
+    const inp = document.getElementById('miniMsgInput');
+    const text = inp.value.trim();
+    if (!text) return;
+    if (!OTHER_USER) { alert('In-call chat is only available for calls linked to an appointment or chat.'); return; }
+    inp.value = '';
+    fetch('api/messages.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'action=send&csrf_token=' + encodeURIComponent(CSRF_TOKEN) + '&receiver_id=' + OTHER_USER + '&message=' + encodeURIComponent(text)
+    }).then(r => r.json()).then(d => {
+        if (d.ok) { miniAppend(text, true, d.id); miniLast = Math.max(miniLast, parseInt(d.id, 10)); }
+        else { inp.value = text; alert(d.error || 'Message not sent.'); }
+    });
+}
+if (OTHER_USER) {
+    setInterval(() => {
+        fetch('api/messages.php?action=fetch&with=' + OTHER_USER + '&last_id=' + miniLast)
+          .then(r => r.json()).then(list => {
+            if (!Array.isArray(list)) return;
+            list.forEach(m => { miniAppend(m.message, m.sender_id == ME, m.id); miniLast = Math.max(miniLast, parseInt(m.id, 10)); });
+          });
+    }, 3000);
+}
 <?php else: ?>
 function joinRoom() {
     const room = document.getElementById('roomInput').value.trim();

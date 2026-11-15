@@ -8,7 +8,7 @@ Options -Indexes
 <IfModule mod_headers.c>
     Header set X-Frame-Options "SAMEORIGIN"
     Header set X-Content-Type-Options "nosniff"
-    Header set X-XSS-Protection "1; mode=block"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
 </IfModule>
 
 # ── Block direct access to sensitive files ───────────────────────────
@@ -23,12 +23,8 @@ Options -Indexes
 </FilesMatch>
 
 # ── Protect the includes folder ──────────────────────────────────────
-<IfModule mod_rewrite.c>
-    RewriteEngine On
-    RewriteBase /telecure/
-    RewriteRule ^includes/ - [F,L]
-    RewriteRule ^api/config - [F,L]
-</IfModule>
+# (includes/ and uploads/ are now protected by their own .htaccess files, so this
+#  no longer depends on a hard-coded folder name such as /telecure/.)
 
 # ── Browser caching for static assets ───────────────────────────────
 <IfModule mod_expires.c>
@@ -47,4 +43,6 @@ Options -Indexes
 </IfModule>
 
 # ── Custom error pages ───────────────────────────────────────────────
-ErrorDocument 404 /telecure/404.php
+# A path here must be absolute from the web root, so it depends on the folder name.
+# Uncomment and adjust to YOUR folder (e.g. http://localhost/Devsync/Telecure/):
+# ErrorDocument 404 /Devsync/Telecure/404.php

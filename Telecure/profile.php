@@ -9,65 +9,99 @@ $msg = '';
 
 // Handle profile update
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_profile'])) {
+    requireCsrf();
     $full_name = sanitize($_POST['full_name'] ?? '');
     $phone     = sanitize($_POST['phone'] ?? '');
     $gender    = sanitize($_POST['gender'] ?? '');
     $dob       = sanitize($_POST['date_of_birth'] ?? '');
     $bio       = sanitize($_POST['bio'] ?? '');
+    $errors    = [];
 
-    if (empty($full_name)) {
-        $msg = '<div class="alert alert-error">Full name is required.</div>';
-    } else {
-        // Optional new profile photo
-        $newPhoto = null;
+    if ($full_name === '') $errors[] = 'Full name is required.';
+    if (!in_array($gender, ['', 'male', 'female', 'other'], true)) $errors[] = 'Invalid gender.';
+    if ($dob !== '') {
+        $d = DateTime::createFromFormat('Y-m-d', $dob);
+        if (!$d || $d->format('Y-m-d') !== $dob || $d > new DateTime('today')) $errors[] = 'Please enter a valid date of birth.';
+    }
+
+    // Password change: needs the CURRENT password (so a hijacked open session can't lock you out).
+    $newPass  = $_POST['new_password'] ?? '';
+    $confPass = $_POST['confirm_new_password'] ?? '';
+    $curPass  = $_POST['current_password'] ?? '';
+    // E-mail change (used for password-reset e-mails, so it must be a real, unique address).
+    $newEmail     = strtolower(trim($_POST['email'] ?? $user['email']));
+    $emailChanged = ($newEmail !== strtolower($user['email']));
+    if ($emailChanged) {
+        if (!filter_var($newEmail, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Please enter a valid e-mail address.';
+        } else {
+            $dup = $db->prepare("SELECT id FROM users WHERE email = ? AND id <> ?");
+            $dup->execute([$newEmail, $user['id']]);
+            if ($dup->fetch()) $errors[] = 'That e-mail address is already used by another account.';
+        }
+    }
+
+    // Changing the password or the e-mail needs the CURRENT password (so a hijacked open session can't lock you out).
+    if ($newPass !== '' || $emailChanged) {
+        $pw = $db->prepare("SELECT password FROM users WHERE id=?");
+        $pw->execute([$user['id']]);
+        if (!password_verify($curPass, (string)$pw->fetchColumn())) $errors[] = 'Your current password is incorrect.';
+        elseif ($newPass !== '' && ($pwErr = passwordPolicyError($newPass))) $errors[] = 'New password: ' . lcfirst($pwErr);
+        elseif ($newPass !== '' && $newPass !== $confPass) $errors[] = 'New passwords do not match.';
+    }
+
+    // Optional new profile photo
+    $newPhoto = null;
+    if (empty($errors)) {
         try {
             $newPhoto = handleAvatarUpload('profile_photo', 'u' . $user['id']);
-        } catch (Exception $e) {
-            $msg = '<div class="alert alert-error">' . htmlspecialchars($e->getMessage()) . '</div>';
+        } catch (Exception $ex) {
+            $errors[] = $ex->getMessage();
         }
+    }
 
-        if ($newPhoto) {
-            $oldPhoto = $user['profile_photo'] ?? null;
-            $db->prepare("UPDATE users SET profile_photo=? WHERE id=?")->execute([$newPhoto, $user['id']]);
+    if (!empty($errors)) {
+        $msg = '<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> ' . implode('<br>', array_map('htmlspecialchars', $errors)) . '</div>';
+    } else {
+        $db->beginTransaction();
+        try {
+            if ($newPhoto) {
+                $db->prepare("UPDATE users SET profile_photo=? WHERE id=?")->execute([$newPhoto, $user['id']]);
+            }
+            $db->prepare("UPDATE users SET full_name=?, phone=?, gender=?, date_of_birth=?, bio=? WHERE id=?")
+               ->execute([$full_name, $phone, $gender ?: null, $dob ?: null, $bio, $user['id']]);
+            if ($emailChanged) {
+                $db->prepare("UPDATE users SET email=? WHERE id=?")->execute([$newEmail, $user['id']]);
+                $db->prepare("DELETE FROM password_resets WHERE user_id=?")->execute([$user['id']]); // old reset links die with the old address
+            }
+
+            if ($role === 'doctor') {
+                $spec  = sanitize($_POST['specialization'] ?? '');
+                $fee   = max(0, (float)($_POST['consultation_fee'] ?? 0));
+                $years = max(0, min(60, (int)($_POST['years_experience'] ?? 0)));
+                $db->prepare("UPDATE doctor_profiles SET specialization=?, consultation_fee=?, years_experience=? WHERE user_id=?")
+                   ->execute([$spec, $fee, $years, $user['id']]);
+            }
+            if ($newPass !== '') {
+                $db->prepare("UPDATE users SET password=? WHERE id=?")->execute([password_hash($newPass, PASSWORD_DEFAULT), $user['id']]);
+            }
+            $db->commit();
+
             // Remove the old locally-uploaded file (never delete seeded http(s) photos or the default).
-            if ($oldPhoto && $oldPhoto !== 'default_avatar.png' && !preg_match('#^https?://#i', $oldPhoto)) {
-                $oldPath = AVATAR_UPLOAD_DIR . basename($oldPhoto);
-                if (file_exists($oldPath)) @unlink($oldPath);
+            if ($newPhoto) {
+                $oldPhoto = $user['profile_photo'] ?? null;
+                if ($oldPhoto && $oldPhoto !== 'default_avatar.png' && !preg_match('#^https?://#i', $oldPhoto)) {
+                    $oldPath = AVATAR_UPLOAD_DIR . basename($oldPhoto);
+                    if (file_exists($oldPath)) @unlink($oldPath);
+                }
             }
+            $_SESSION['user_name'] = $full_name;
+            $msg = '<div class="alert alert-success"><i class="fas fa-check-circle"></i> Profile updated successfully!' . ($newPass !== '' ? ' Password changed.' : '') . ($emailChanged ? ' E-mail changed - use ' . htmlspecialchars($newEmail) . ' to sign in from now on.' : '') . '</div>';
+            $user = currentUser(); // Reload
+        } catch (Exception $ex) {
+            $db->rollBack();
+            $msg = '<div class="alert alert-error">Could not save your profile. Please try again.</div>';
         }
-
-        $db->prepare("UPDATE users SET full_name=?, phone=?, gender=?, date_of_birth=?, bio=? WHERE id=?")
-           ->execute([$full_name, $phone, $gender, $dob ?: null, $bio, $user['id']]);
-
-        if ($role === 'doctor') {
-            $spec  = sanitize($_POST['specialization'] ?? '');
-            $fee   = (float)($_POST['consultation_fee'] ?? 0);
-            $years = (int)($_POST['years_experience'] ?? 0);
-            $db->prepare("UPDATE doctor_profiles SET specialization=?, consultation_fee=?, years_experience=? WHERE user_id=?")
-               ->execute([$spec, $fee, $years, $user['id']]);
-        }
-
-        // Handle password change
-        $newPass = $_POST['new_password'] ?? '';
-        $confPass = $_POST['confirm_new_password'] ?? '';
-        if (!empty($newPass)) {
-            if (strlen($newPass) < 8) {
-                $msg = '<div class="alert alert-error">New password must be at least 8 characters.</div>';
-            } elseif ($newPass !== $confPass) {
-                $msg = '<div class="alert alert-error">Passwords do not match.</div>';
-            } else {
-                $hashed = password_hash($newPass, PASSWORD_DEFAULT);
-                $db->prepare("UPDATE users SET password=? WHERE id=?")->execute([$hashed, $user['id']]);
-                $msg .= '<div class="alert alert-success"><i class="fas fa-check-circle"></i> Password updated!</div>';
-            }
-        }
-
-        if (!$msg) {
-            $msg = '<div class="alert alert-success"><i class="fas fa-check-circle"></i> Profile updated successfully!</div>';
-        }
-
-        $_SESSION['user_name'] = $full_name;
-        $user = currentUser(); // Reload
     }
 }
 
@@ -198,6 +232,7 @@ $avatarUrl = avatarUrl($user, 120);
             <!-- Right: Edit Form -->
             <div class="profile-form-card">
                 <form method="POST" action="profile.php" id="profileForm" enctype="multipart/form-data">
+                    <?= csrf_field() ?>
                     <!-- Personal Info -->
                     <div class="form-section">
                         <div class="form-section-title"><i class="fas fa-user"></i> Personal Information</div>
@@ -208,7 +243,8 @@ $avatarUrl = avatarUrl($user, 120);
                             </div>
                             <div class="form-group">
                                 <label>Email Address</label>
-                                <input type="email" value="<?= htmlspecialchars($user['email']) ?>" disabled style="opacity: 0.6; cursor: not-allowed;">
+                                <input type="email" name="email" value="<?= htmlspecialchars($user['email']) ?>" required>
+                                <small style="color:var(--text-light)">This is your sign-in name and where password-reset e-mails are sent. Changing it needs your current password (see "Change Password" below).</small>
                                 <small style="color: var(--text-light); font-size: 0.78rem;"><i class="fas fa-info-circle"></i> Email cannot be changed</small>
                             </div>
                         </div>
@@ -266,11 +302,16 @@ $avatarUrl = avatarUrl($user, 120);
                     <!-- Change Password -->
                     <div class="form-section">
                         <div class="form-section-title"><i class="fas fa-lock"></i> Change Password</div>
+                        <div class="form-group">
+                            <label>Current Password <small style="color:var(--text-light)">(needed to change your password or e-mail)</small></label>
+                            <input type="password" name="current_password" autocomplete="current-password" placeholder="Your current password">
+                        </div>
+                        <ul class="pw-rules" id="profileRules" aria-live="polite"></ul>
                         <div class="form-row">
                             <div class="form-group">
                                 <label>New Password</label>
                                 <div class="password-wrapper">
-                                    <input type="password" name="new_password" id="newPass" placeholder="Leave blank to keep current">
+                                    <input type="password" name="new_password" id="newPass" placeholder="Leave blank to keep current" autocomplete="new-password" data-password-rules="profileRules">
                                     <button type="button" class="toggle-pass" onclick="togglePass('newPass')"><i class="fas fa-eye"></i></button>
                                 </div>
                             </div>
@@ -297,6 +338,7 @@ $avatarUrl = avatarUrl($user, 120);
 </div>
 
 <script src="js/dashboard.js"></script>
+<script src="js/password-rules.js"></script>
 <script>
 function togglePass(id) {
     const inp = document.getElementById(id);

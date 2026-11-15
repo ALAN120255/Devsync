@@ -10,67 +10,113 @@ $error = '';
 
 // Book appointment
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book_appointment'])) {
-    $doctorId = (int)$_POST['doctor_id'];
-    $date     = sanitize($_POST['appointment_date']);
-    $time     = sanitize($_POST['appointment_time']);
-    $type     = sanitize($_POST['type']);
-    $reason   = sanitize($_POST['reason']);
+    requireCsrf();
+    $doctorId = (int)($_POST['doctor_id'] ?? 0);
+    $date     = sanitize($_POST['appointment_date'] ?? '');
+    $time     = sanitize($_POST['appointment_time'] ?? '');
+    $type     = sanitize($_POST['type'] ?? 'video');
+    $reason   = sanitize($_POST['reason'] ?? '');
+
+    $dateObj  = DateTime::createFromFormat('Y-m-d', $date);
+    $validDate = $dateObj && $dateObj->format('Y-m-d') === $date;
 
     if ($role !== 'patient') {
         $error = 'Only patients can book appointments.';
     } elseif (!$doctorId || !$date || !$time) {
         $error = 'Please fill in all required fields.';
-    } elseif (strtotime($date) < strtotime('today')) {
-        $error = 'Please select a future date.';
+    } elseif (!$validDate) {
+        $error = 'Please choose a valid date.';
+    } elseif (!in_array($type, ['video', 'chat', 'in_person'], true)) {
+        $error = 'Invalid consultation type.';
+    } elseif (!in_array($time, appointmentSlots(), true)) {
+        $error = 'Please choose one of the available time slots.';
+    } elseif (strtotime("$date $time") <= time()) {
+        $error = 'Please select a date and time in the future.';
     } else {
-        // Check for conflicts
-        $check = $db->prepare("SELECT id FROM appointments WHERE doctor_id=? AND appointment_date=? AND appointment_time=? AND status NOT IN ('cancelled')");
-        $check->execute([$doctorId, $date, $time]);
-        if ($check->fetch()) {
-            $error = 'This time slot is already booked. Please choose another time.';
+        // The doctor must exist, be active and verified.
+        $dchk = $db->prepare("SELECT u.full_name FROM users u JOIN doctor_profiles dp ON dp.user_id = u.id
+                              WHERE u.id = ? AND u.role = 'doctor' AND u.is_active = 1 AND dp.is_verified = 1");
+        $dchk->execute([$doctorId]);
+        if (!$dchk->fetch()) {
+            $error = 'That doctor is not available for booking.';
         } else {
-            $stmt = $db->prepare("INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, type, reason, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
-            $stmt->execute([$user['id'], $doctorId, $date, $time, $type, $reason]);
-            $apptId = $db->lastInsertId();
+            // Check for conflicts inside a transaction so two patients cannot grab the same slot.
+            $db->beginTransaction();
+            try {
+                // Lock the doctor's row first: concurrent bookings for this doctor queue up here,
+                // so the conflict check below is always against the latest data.
+                $db->prepare("SELECT id FROM users WHERE id = ? FOR UPDATE")->execute([$doctorId]);
+                $check = $db->prepare("SELECT id FROM appointments WHERE doctor_id=? AND appointment_date=? AND appointment_time=? AND status NOT IN ('cancelled') FOR UPDATE");
+                $check->execute([$doctorId, $date, $time]);
+                if ($check->fetch()) {
+                    $db->rollBack();
+                    $error = 'Sorry - someone else just booked that slot. The list below now shows the times that are still free.';
+                } else {
+                    $stmt = $db->prepare("INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, type, reason, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')");
+                    $stmt->execute([$user['id'], $doctorId, $date, $time, $type, $reason]);
+                    $apptId = $db->lastInsertId();
 
-            // Create video session if needed
-            if ($type === 'video') {
-                $roomName = 'telecure-' . $apptId . '-' . bin2hex(random_bytes(4));
-                $db->prepare("INSERT INTO video_sessions (appointment_id, room_name) VALUES (?, ?)")->execute([$apptId, $roomName]);
+                    // Create video session if needed
+                    if ($type === 'video') {
+                        $roomName = 'telecure-' . $apptId . '-' . bin2hex(random_bytes(4));
+                        $db->prepare("INSERT INTO video_sessions (appointment_id, room_name) VALUES (?, ?)")->execute([$apptId, $roomName]);
+                    }
+                    $db->commit();
+
+                    addNotification($doctorId, 'New Appointment Request', $user['full_name'] . ' booked an appointment on ' . date('M j, Y', strtotime($date)) . ' at ' . date('g:i A', strtotime($time)), 'appointment');
+                    $msg = 'Appointment booked successfully! The doctor will confirm shortly.';
+                }
+            } catch (Exception $ex) {
+                if ($db->inTransaction()) $db->rollBack();
+                $error = 'Could not book the appointment. Please try again.';
             }
-
-            // Notify doctor
-            $doctorInfo = $db->prepare("SELECT full_name FROM users WHERE id=?")->execute([$doctorId]);
-            addNotification($doctorId, 'New Appointment Request', $user['full_name'] . ' booked an appointment on ' . date('M j, Y', strtotime($date)) . ' at ' . date('g:i A', strtotime($time)), 'appointment');
-
-            $msg = 'Appointment booked successfully! The doctor will confirm shortly.';
         }
     }
 }
 
-// Update appointment status (doctor action)
+// Update appointment status.
+//  - Doctors can confirm / complete / cancel THEIR appointments.
+//  - Patients can cancel THEIR OWN appointments (the Cancel button used to do nothing for patients).
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_status'])) {
-    $apptId  = (int)$_POST['appointment_id'];
-    $status  = sanitize($_POST['status']);
-    $allowed = ['confirmed','completed','cancelled'];
-    
-    if ($role === 'doctor' && in_array($status, $allowed)) {
-        $db->prepare("UPDATE appointments SET status=? WHERE id=? AND doctor_id=?")->execute([$status, $apptId, $user['id']]);
-        
-        // Get patient id to notify
-        $pt = $db->prepare("SELECT patient_id FROM appointments WHERE id=?");
-        $pt->execute([$apptId]);
-        $pid = $pt->fetchColumn();
-        addNotification($pid, 'Appointment ' . ucfirst($status), 'Your appointment has been ' . $status . '.', 'appointment');
-        $msg = 'Appointment status updated!';
+    requireCsrf();
+    $apptId = (int)($_POST['appointment_id'] ?? 0);
+    $status = sanitize($_POST['status'] ?? '');
+    $allowed = ($role === 'doctor') ? ['confirmed', 'completed', 'cancelled'] : ['cancelled'];
+
+    if (!in_array($status, $allowed, true)) {
+        $error = 'You are not allowed to do that.';
+    } else {
+        $ownerCol = ($role === 'doctor') ? 'doctor_id' : 'patient_id';
+        $otherCol = ($role === 'doctor') ? 'patient_id' : 'doctor_id';
+
+        $cur = $db->prepare("SELECT status, $otherCol AS other_id FROM appointments WHERE id=? AND $ownerCol=?");
+        $cur->execute([$apptId, $user['id']]);
+        $row = $cur->fetch();
+
+        if (!$row) {
+            $error = 'Appointment not found.';
+        } elseif (in_array($row['status'], ['cancelled', 'completed'], true)) {
+            $error = 'This appointment is already ' . $row['status'] . '.';
+        } elseif ($status === 'confirmed' && $row['status'] !== 'pending') {
+            $error = 'Only pending appointments can be confirmed.';
+        } elseif ($status === 'completed' && $row['status'] !== 'confirmed') {
+            $error = 'Confirm the appointment before marking it completed.';
+        } else {
+            $db->prepare("UPDATE appointments SET status=? WHERE id=? AND $ownerCol=?")->execute([$status, $apptId, $user['id']]);
+            $who = ($role === 'doctor') ? doctorName($user['full_name']) : $user['full_name'];
+            addNotification($row['other_id'], 'Appointment ' . ucfirst($status), $who . ' marked your appointment as ' . $status . '.', 'appointment');
+            $msg = 'Appointment ' . $status . '.';
+        }
     }
 }
 
 // Get appointments
 $filter = sanitize($_GET['filter'] ?? 'upcoming');
+if (!in_array($filter, ['upcoming','past','pending','confirmed','cancelled'], true)) $filter = 'upcoming';
 $filterMap = [
-    'upcoming' => "AND a.appointment_date >= CURDATE() AND a.status NOT IN ('cancelled')",
-    'past' => "AND a.appointment_date < CURDATE()",
+    // Judged by date AND time (1 hour grace so a consultation that is under way stays "upcoming").
+    'upcoming' => "AND TIMESTAMP(a.appointment_date, a.appointment_time) >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND a.status NOT IN ('cancelled')",
+    'past' => "AND TIMESTAMP(a.appointment_date, a.appointment_time) < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
     'pending' => "AND a.status = 'pending'",
     'confirmed' => "AND a.status = 'confirmed'",
     'cancelled' => "AND a.status = 'cancelled'"
@@ -105,7 +151,12 @@ $doctors = $db->query("SELECT u.id, u.full_name, dp.specialization, dp.consultat
     FROM users u JOIN doctor_profiles dp ON u.id = dp.user_id
     WHERE u.role='doctor' AND dp.is_verified=1 ORDER BY dp.rating DESC")->fetchAll();
 
-$selectedDoctor = isset($_GET['doctor']) ? (int)$_GET['doctor'] : null;
+$bookingFailed = ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book_appointment']) && !empty($error));
+$selectedDoctor = $bookingFailed ? (int)($_POST['doctor_id'] ?? 0) : (isset($_GET['doctor']) ? (int)$_GET['doctor'] : null);
+$formDate = $bookingFailed ? sanitize($_POST['appointment_date'] ?? '') : sanitize($_GET['date'] ?? '');
+$formTime = $bookingFailed ? sanitize($_POST['appointment_time'] ?? '') : sanitize($_GET['time'] ?? '');
+$formType = $bookingFailed ? sanitize($_POST['type'] ?? 'video') : 'video';
+$formReason = $bookingFailed ? sanitize($_POST['reason'] ?? '') : '';
 $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
 ?>
 <!DOCTYPE html>
@@ -133,14 +184,14 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
                 <p><?= $role === 'patient' ? 'Manage your appointments with doctors' : 'Your patient appointments' ?></p>
             </div>
             <?php if ($role === 'patient'): ?>
-            <button class="btn-primary" onclick="document.getElementById('bookModal').style.display='flex'">
+            <button class="btn-primary" onclick="openBooking()">
                 <i class="fas fa-calendar-plus"></i> Book Appointment
             </button>
             <?php endif; ?>
         </div>
 
-        <?php if ($msg): ?><div class="alert alert-success"><i class="fas fa-check-circle"></i> <?= $msg ?></div><?php endif; ?>
-        <?php if ($error): ?><div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> <?= $error ?></div><?php endif; ?>
+        <?php if ($msg): ?><div class="alert alert-success"><i class="fas fa-check-circle"></i> <?= e($msg) ?></div><?php endif; ?>
+        <?php if ($error): ?><div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> <?= e($error) ?></div><?php endif; ?>
 
         <!-- Filter Tabs -->
         <div class="filter-tabs">
@@ -156,10 +207,10 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
             <?php if (empty($appointments)): ?>
             <div class="empty-state full-width">
                 <i class="fas fa-calendar-times"></i>
-                <h3>No <?= $filter ?> appointments</h3>
+                <h3>No <?= e($filter) ?> appointments</h3>
                 <?php if ($role === 'patient'): ?>
                 <p>Book your first appointment with one of our doctors</p>
-                <button onclick="document.getElementById('bookModal').style.display='flex'" class="btn-primary">Book Now</button>
+                <button onclick="openBooking()" class="btn-primary">Book Now</button>
                 <?php else: ?>
                 <p>No patient appointments in this category</p>
                 <?php endif; ?>
@@ -196,7 +247,7 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
                 </div>
                 <div class="appt-card-actions">
                     <?php if ($appt['type'] === 'video' && $appt['status'] === 'confirmed' && isset($appt['video_room'])): ?>
-                    <a href="video.php?room=<?= $appt['video_room'] ?>" class="btn-video-join">
+                    <a href="video.php?room=<?= urlencode($appt['video_room']) ?>" class="btn-video-join">
                         <i class="fas fa-video"></i> Join Video Call
                     </a>
                     <?php endif; ?>
@@ -205,21 +256,36 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
                     </a>
                     <?php if ($role === 'doctor' && $appt['status'] === 'pending'): ?>
                     <form method="POST" style="display:inline">
-                        <input type="hidden" name="appointment_id" value="<?= $appt['id'] ?>">
+                        <?= csrf_field() ?>
+                        <input type="hidden" name="appointment_id" value="<?= (int)$appt['id'] ?>">
                         <input type="hidden" name="status" value="confirmed">
                         <button type="submit" name="update_status" class="btn-confirm-sm">
                             <i class="fas fa-check"></i> Confirm
                         </button>
                     </form>
                     <?php endif; ?>
+                    <?php if ($role === 'doctor' && $appt['status'] === 'confirmed'): ?>
+                    <form method="POST" style="display:inline" onsubmit="return confirm('Mark this consultation as completed?')">
+                        <?= csrf_field() ?>
+                        <input type="hidden" name="appointment_id" value="<?= (int)$appt['id'] ?>">
+                        <input type="hidden" name="status" value="completed">
+                        <button type="submit" name="update_status" class="btn-confirm-sm">
+                            <i class="fas fa-check-double"></i> Complete
+                        </button>
+                    </form>
+                    <?php endif; ?>
                     <?php if ($appt['status'] !== 'cancelled' && $appt['status'] !== 'completed'): ?>
                     <form method="POST" style="display:inline" onsubmit="return confirm('Cancel this appointment?')">
-                        <input type="hidden" name="appointment_id" value="<?= $appt['id'] ?>">
+                        <?= csrf_field() ?>
+                        <input type="hidden" name="appointment_id" value="<?= (int)$appt['id'] ?>">
                         <input type="hidden" name="status" value="cancelled">
                         <button type="submit" name="update_status" class="btn-cancel-sm">
                             <i class="fas fa-times"></i> Cancel
                         </button>
                     </form>
+                    <?php endif; ?>
+                    <?php if ($role === 'patient' && $appt['status'] === 'completed'): ?>
+                    <a href="doctor_profile.php?id=<?= (int)$appt['doctor_id'] ?>#reviews" class="btn-chat-sm"><i class="fas fa-star"></i> Review</a>
                     <?php endif; ?>
                 </div>
             </div>
@@ -229,7 +295,7 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
 </div>
 
 <!-- Book Appointment Modal -->
-<div class="modal-overlay" id="bookModal" style="display:<?= ($_GET['action'] ?? '') === 'book' ? 'flex' : 'none' ?>">
+<div class="modal-overlay" id="bookModal" style="display:<?= (($_GET['action'] ?? '') === 'book' || $bookingFailed) ? 'flex' : 'none' ?>">
     <div class="modal modal-large">
         <div class="modal-header">
             <h3><i class="fas fa-calendar-plus"></i> Book Appointment</h3>
@@ -237,9 +303,10 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
         </div>
         <div class="modal-body">
             <form method="POST" action="appointments.php" class="book-form">
+                <?= csrf_field() ?>
                 <div class="form-group">
                     <label>Choose Doctor</label>
-                    <select name="doctor_id" required onchange="updateFee(this)">
+                    <select name="doctor_id" id="bookDoctor" required onchange="updateFee(this); loadSlots(false)">
                         <option value="">Select a doctor...</option>
                         <?php foreach ($doctors as $doc): ?>
                         <option value="<?= $doc['id'] ?>" data-fee="<?= $doc['consultation_fee'] ?>" <?= $selectedDoctor == $doc['id'] ? 'selected' : '' ?>>
@@ -254,38 +321,35 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
                 <div class="form-row">
                     <div class="form-group">
                         <label>Appointment Date</label>
-                        <input type="date" name="appointment_date" required min="<?= date('Y-m-d') ?>" value="<?= htmlspecialchars($_GET['date'] ?? '') ?>">
+                        <input type="date" name="appointment_date" id="bookDate" required min="<?= date('Y-m-d') ?>" value="<?= htmlspecialchars($formDate) ?>" onchange="loadSlots(false)">
                     </div>
                     <div class="form-group">
                         <label>Preferred Time</label>
-                        <select name="appointment_time" required>
-                            <?php
-                            $times = ['08:00','08:30','09:00','09:30','10:00','10:30','11:00','11:30','12:00','12:30','14:00','14:30','15:00','15:30','16:00','16:30'];
-                            foreach ($times as $t): ?>
-                            <option value="<?= $t ?>" <?= (isset($_GET['time']) && $_GET['time']===$t) ? 'selected' : '' ?>><?= date('g:i A', strtotime($t)) ?></option>
-                            <?php endforeach; ?>
+                        <select name="appointment_time" id="bookTime" required>
+                            <option value="">Select doctor &amp; date first</option>
                         </select>
+                        <small id="liveStatus" class="live-status off"><span class="live-dot"></span> Waiting for doctor &amp; date</small>
                     </div>
                 </div>
                 <div class="form-group">
                     <label>Consultation Type</label>
                     <div class="type-selector">
                         <label class="type-option">
-                            <input type="radio" name="type" value="video" checked>
+                            <input type="radio" name="type" value="video" <?= $formType === 'video' ? 'checked' : '' ?>>
                             <div class="type-card">
                                 <i class="fas fa-video"></i>
                                 <span>Video Call</span>
                             </div>
                         </label>
                         <label class="type-option">
-                            <input type="radio" name="type" value="chat">
+                            <input type="radio" name="type" value="chat" <?= $formType === 'chat' ? 'checked' : '' ?>>
                             <div class="type-card">
                                 <i class="fas fa-comment-medical"></i>
                                 <span>Chat</span>
                             </div>
                         </label>
                         <label class="type-option">
-                            <input type="radio" name="type" value="in_person">
+                            <input type="radio" name="type" value="in_person" <?= $formType === 'in_person' ? 'checked' : '' ?>>
                             <div class="type-card">
                                 <i class="fas fa-hospital"></i>
                                 <span>In-Person</span>
@@ -295,7 +359,7 @@ $showBooking = ($_GET['action'] ?? '') === 'book' || $role === 'patient';
                 </div>
                 <div class="form-group">
                     <label>Reason for Visit</label>
-                    <textarea name="reason" placeholder="Briefly describe your symptoms or reason for appointment..." rows="3"></textarea>
+                    <textarea name="reason" placeholder="Briefly describe your symptoms or reason for appointment..." rows="3"><?= htmlspecialchars($formReason) ?></textarea>
                 </div>
                 <div class="modal-actions">
                     <button type="button" onclick="document.getElementById('bookModal').style.display='none'" class="btn-outline-cancel">Cancel</button>
@@ -319,6 +383,101 @@ function updateFee(sel) {
         document.getElementById('feeDisplay').style.display = 'none';
     }
 }
+
+// ── Live slot availability (api/appointments.php?action=slots) ─────────────────
+// Re-checked every 5 seconds while the booking window is open, and instantly when the
+// doctor/date changes or the tab regains focus, so the list is never stale.
+var preselectTime = <?= json_encode($formTime) ?>;
+var SLOT_REFRESH_MS = 5000;
+var slotTimer = null, slotReq = 0;
+
+function bookModalOpen() {
+    var m = document.getElementById('bookModal');
+    return m && m.style.display !== 'none';
+}
+
+function setLiveStatus(text, ok) {
+    var el = document.getElementById('liveStatus');
+    if (!el) return;
+    el.className = 'live-status ' + (ok ? 'on' : 'off');
+    el.innerHTML = '<span class="live-dot"></span> ' + text;
+}
+
+function loadSlots(silent) {
+    var doc  = document.getElementById('bookDoctor').value;
+    var date = document.getElementById('bookDate').value;
+    var sel  = document.getElementById('bookTime');
+    if (!doc || !date) { sel.innerHTML = '<option value="">Select doctor &amp; date first</option>'; setLiveStatus('Waiting for doctor &amp; date', false); return; }
+
+    var keep = sel.value || preselectTime;           // remember what the patient had picked
+    var myReq = ++slotReq;
+    if (!silent) sel.innerHTML = '<option value="">Loading...</option>';
+
+    fetch('api/appointments.php?action=slots&doctor_id=' + encodeURIComponent(doc) + '&date=' + encodeURIComponent(date) + '&_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (myReq !== slotReq) return;           // a newer request is already in flight
+            var slots = data.slots || [];
+            var free = slots.filter(function (s) { return s.available; });
+            sel.innerHTML = '';
+            if (!free.length) {
+                sel.innerHTML = '<option value="">No free slots on this date</option>';
+            } else {
+                var placeholder = document.createElement('option');
+                placeholder.value = ''; placeholder.textContent = 'Select a time (' + free.length + ' free)';
+                sel.appendChild(placeholder);
+                free.forEach(function (s) {
+                    var o = document.createElement('option');
+                    o.value = s.time; o.textContent = s.label;
+                    sel.appendChild(o);
+                });
+                if (keep && free.some(function (s) { return s.time === keep; })) sel.value = keep;
+            }
+            if (keep && sel.value !== keep && silent) {
+                setLiveStatus('Your chosen time was just taken - please pick another', false);
+                return;
+            }
+            preselectTime = '';
+            setLiveStatus('Live &middot; updated ' + (data.now_label || new Date().toLocaleTimeString()), true);
+        })
+        .catch(function () { if (myReq === slotReq && !silent) sel.innerHTML = '<option value="">Could not load slots</option>'; setLiveStatus('Connection lost - retrying...', false); });
+}
+
+function startSlotPolling() {
+    stopSlotPolling();
+    slotTimer = setInterval(function () { if (!document.hidden && bookModalOpen()) loadSlots(true); }, SLOT_REFRESH_MS);
+}
+function stopSlotPolling() { if (slotTimer) { clearInterval(slotTimer); slotTimer = null; } }
+document.addEventListener('visibilitychange', function () { if (!document.hidden && bookModalOpen()) loadSlots(true); });
+window.addEventListener('focus', function () { if (bookModalOpen()) loadSlots(true); });
+
+// Opening the booking window refreshes immediately.
+function openBooking() {
+    document.getElementById('bookModal').style.display = 'flex';
+    loadSlots(false);
+}
+
+// ── Keep the appointment list itself up to date (new requests, confirmations, cancellations) ──
+var listSig = null;
+function checkList() {
+    if (document.hidden || bookModalOpen()) return;   // never yank the page away while someone is booking
+    fetch('api/appointments.php?action=signature&_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+            if (listSig === null) { listSig = d.sig; return; }
+            // replace() = a fresh GET, so the browser never re-submits a booking form.
+            if (d.sig !== listSig && !bookModalOpen()) location.replace(location.pathname + location.search);
+        }).catch(function () {});
+}
+checkList();
+setInterval(checkList, 8000);
+
+document.addEventListener('DOMContentLoaded', function () {
+    var d = document.getElementById('bookDoctor');
+    if (d && d.value) updateFee(d);
+    loadSlots(false);
+    startSlotPolling();
+});
 
 document.getElementById('bookModal')?.addEventListener('click', function(e) {
     if (e.target === this) this.style.display = 'none';

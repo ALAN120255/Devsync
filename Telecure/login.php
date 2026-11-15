@@ -9,10 +9,16 @@ if (isLoggedIn()) {
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $email    = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
+    requireCsrf();
+    $email    = strtolower(trim($_POST['email'] ?? ''));
     $password = $_POST['password'] ?? '';
 
-    if (empty($email) || empty($password)) {
+    // Basic brute-force throttle: 5 failed attempts => 5 minute lock (per session).
+    $locked = isset($_SESSION['login_lock_until']) && $_SESSION['login_lock_until'] > time();
+
+    if ($locked) {
+        $error = 'Too many failed attempts. Please wait a few minutes and try again.';
+    } elseif (empty($email) || empty($password)) {
         $error = 'Please fill in all fields.';
     } else {
         $db = getDB();
@@ -21,6 +27,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $user = $stmt->fetch();
 
         if ($user && password_verify($password, $user['password'])) {
+            session_regenerate_id(true); // prevent session fixation
+            unset($_SESSION['login_fails'], $_SESSION['login_lock_until']);
             $_SESSION['user_id']   = $user['id'];
             $_SESSION['user_role'] = $user['role'];
             $_SESSION['user_name'] = $user['full_name'];
@@ -31,6 +39,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: dashboard.php');
             exit;
         } else {
+            $_SESSION['login_fails'] = ($_SESSION['login_fails'] ?? 0) + 1;
+            if ($_SESSION['login_fails'] >= 5) {
+                $_SESSION['login_lock_until'] = time() + 300;
+                $_SESSION['login_fails'] = 0;
+            }
             $error = 'Invalid email or password.';
         }
     }
@@ -86,6 +99,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
             <?php endif; ?>
 
+            <?php if (isset($_GET['logged_out'])): ?>
+            <div class="alert alert-success">
+                <i class="fas fa-check-circle"></i> You have been signed out.
+            </div>
+            <?php endif; ?>
+
             <?php if (isset($_GET['registered'])): ?>
             <div class="alert alert-success">
                 <i class="fas fa-check-circle"></i> Account created successfully! Please sign in.
@@ -93,6 +112,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <?php endif; ?>
 
             <form method="POST" action="login.php" class="auth-form">
+                <?= csrf_field() ?>
                 <div class="form-group">
                     <label><i class="fas fa-envelope"></i> Email Address</label>
                     <input type="email" name="email" placeholder="your@email.com" required value="<?= htmlspecialchars($_POST['email'] ?? '') ?>">
@@ -109,9 +129,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
 
                 <div class="form-row form-remember">
-                    <label class="checkbox-label">
-                        <input type="checkbox" name="remember"> Remember me
-                    </label>
+                    <span></span>
                     <a href="reset_password.php" class="forgot-link">Forgot password?</a>
                 </div>
 
@@ -124,6 +142,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="demo-btns">
                         <button type="button" onclick="fillDemo('sarah@telecure.com','password')">
                             <i class="fas fa-user-md"></i> Demo Doctor
+                        </button>
+                        <button type="button" onclick="fillDemo('patient@telecure.com','password')">
+                            <i class="fas fa-user"></i> Demo Patient
                         </button>
                     </div>
                 </div>

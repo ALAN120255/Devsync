@@ -1,192 +1,75 @@
-# TeleCure — Telemedicine Platform
-## Complete Setup Guide for WAMP/XAMPP
+# TeleCure – Telehealth Platform
 
----
+PHP + MySQL telehealth app: patient/doctor accounts, appointment booking, chat,
+video consultations (Jitsi), prescriptions, reviews and an admin panel.
 
-## 📁 Project Structure
+## Requirements
+- PHP **7.1+** (tested on 8.3) with PDO MySQL (mbstring optional)
+- MySQL / MariaDB, Apache (WAMP/XAMPP) – any folder name works (e.g. `htdocs/Devsync/Telecure`)
 
-```
-telecure/
-├── index.php              ← Landing page
-├── register.php           ← Patient / Doctor registration
-├── login.php              ← Login
-├── logout.php             ← Session destroy
-├── dashboard.php          ← Role-aware dashboard
-├── find_doctors.php       ← Search & filter doctors (patient)
-├── doctor_profile.php     ← Doctor public profile + reviews
-├── appointments.php       ← Book & manage appointments
-├── chat.php               ← Real-time messaging
-├── video.php              ← Video consultations (Jitsi)
-├── prescriptions.php      ← Digital prescriptions
-├── profile.php            ← Edit profile & password
-├── notifications.php      ← Notification centre
-├── admin.php              ← Admin panel (doctors)
-├── reset_password.php     ← Password recovery
-├── 404.php                ← Custom 404 page
-├── .htaccess              ← Apache security rules
-├── telecure_db.sql        ← Full database schema + seed data
-│
-├── includes/
-│   ├── config.php         ← DB connection, helpers, session
-│   ├── sidebar.php        ← Sidebar navigation
-│   └── topbar.php         ← Top navigation bar
-│
-├── api/
-│   ├── messages.php       ← AJAX chat API
-│   └── appointments.php   ← AJAX slots API
-│
-├── css/
-│   ├── style.css          ← Global styles
-│   ├── auth.css           ← Login / Register styles
-│   ├── dashboard.css      ← Dashboard layout
-│   ├── chat.css           ← Chat interface
-│   ├── prescriptions.css  ← Prescription styles
-│   ├── video.css          ← Video call styles
-│   └── animations.css     ← All animations
-│
-├── js/
-│   ├── main.js            ← Homepage JS (counter, slider, particles)
-│   ├── dashboard.js       ← Sidebar, notifications, ripple effects
-│   └── animations.js      ← Scroll animations, stagger effects
-│
-└── uploads/
-    └── avatars/           ← User profile photos
-```
+## Setup
+1. Copy the project into your web root, e.g. `C:\wamp64\www\Devsync\Telecure`.
+2. In phpMyAdmin, import `telecure_db.sql` (creates `telecure_db` with demo data).
+   - **Already have the old database?** Run `migrations/001_fixes.sql` once instead.
+3. Check DB settings in `includes/config.php` (`DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME`).
+4. Make sure `uploads/avatars/` is writable.
+5. Open `http://localhost/Devsync/Telecure/`.
+6. Optional: uncomment and edit the `ErrorDocument 404` line in `.htaccess` for your folder.
 
----
+## Demo accounts (password for all: `password`)
+| Role | Email |
+|---|---|
+| Doctor + Administrator | sarah@telecure.com |
+| Doctor | michael@telecure.com, priya@telecure.com |
+| Patient | patient@telecure.com |
 
-## ⚙️ Installation Steps
+## Time zone
+All appointment times use `APP_TIMEZONE` (default `Africa/Johannesburg`, set at the top of
+`includes/config.php`), for both PHP and MySQL, so it no longer depends on `php.ini`. Change it if
+you are in another time zone.
 
-### 1. Install WAMP or XAMPP
-- Download from https://www.wampserver.com or https://www.apachefriends.org
-- Start Apache and MySQL services
+## Using a real e-mail address
+The demo accounts use fake addresses (`@telecure.com`), so e-mails to them go nowhere. To receive real
+e-mails: sign in, open **My Profile**, type your real address in *Email*, enter your current password
+under *Change Password* and save. Use the new address to sign in from then on (the administrator keeps
+admin rights). Or simply register a new account with your real address.
 
-### 2. Copy Project Files
-```
-Copy the entire `telecure` folder to:
-  WAMP:  C:\wamp64\www\telecure\
-  XAMPP: C:\xampp\htdocs\telecure\
-```
+## Passwords and live booking
+- New passwords (register, forgot-password, My Profile) need **8+ characters, at least one number and one special character**. A live checklist shows the rules as the person types, and the server enforces them. The demo accounts keep the old password `password` until it is changed.
+- Booking is live: time slots are re-checked every 5 seconds (and when the tab regains focus) on both the Book Appointment window and the doctor's profile page, a slot someone else just took disappears or is un-selected with a notice, and the appointment list refreshes itself when a request is made/confirmed/cancelled. Double-bookings are blocked on the server.
 
-### 3. Create Database in phpMyAdmin
-1. Open browser → http://localhost/phpmyadmin
-2. Click **New** in the left sidebar
-3. Database name: `telecure_db`
-4. Collation: `utf8mb4_unicode_ci`
-5. Click **Create**
-6. Click the `telecure_db` database → **Import** tab
-7. Choose file: `telecure_db.sql`
-8. Click **Go**
+## Roles
+- **Patient:** find doctors, book/cancel appointments, chat, join video calls, view prescriptions, review doctors after a completed consultation.
+- **Doctor:** confirm / complete / cancel appointments, chat, video, write prescriptions (only once verified).
+- **Administrator** (`users.is_admin = 1`): verify doctors, activate/deactivate users.
 
-### 4. Configure Database Connection
-Edit `includes/config.php`:
-```php
-define('DB_HOST', 'localhost');
-define('DB_USER', 'root');      // Your phpMyAdmin username
-define('DB_PASS', '');          // Your phpMyAdmin password (blank by default in WAMP)
-define('DB_NAME', 'telecure_db');
-define('SITE_URL', 'http://localhost/telecure');
-```
+## Notes
+- New doctors are hidden until an administrator verifies them.
+- Password reset e-mails are sent over SMTP (see **E-mail setup** below). If sending fails and you are browsing from localhost, the page shows the technical reason and a direct reset link so you can keep testing. Visitors on a live site only ever see a generic message.
+- Video uses the public Jitsi server (meet.jit.si); this is not a guarantee of end-to-end encryption. Review privacy/POPIA requirements before real patient use.
+- Consultation notes in the video page are saved in the browser only.
 
-### 5. Set PHP Version (Important!)
-- The code is compatible with **PHP 5.6, 7.x, and 8.x**
-- In WAMP: Left-click tray icon → PHP → PHP version → choose any version
+## E-mail setup (password reset) – done on the website
+Sign in as an administrator (`sarah@telecure.com`) and open **Email Settings** in the sidebar
+(or Admin Panel > Email Settings). No files to edit.
 
-### 6. Open in Browser
-```
-http://localhost/telecure
-```
+1. Pick a provider under *Quick setup* (Gmail, Outlook, Brevo, Mailtrap) or enter your own SMTP details.
+2. **Gmail:** turn on 2-Step Verification, create an *App password* at
+   <https://myaccount.google.com/apppasswords> and paste it as the password
+   (your normal Gmail password will not work).
+3. Check the *website address* (e.g. `http://localhost/Devsync/Telecure`) – it is used inside e-mailed links.
+4. Tick **Enable sending e-mails**, then click **Save & send test e-mail to me**.
+   A readable error is shown if the server refuses the details.
+5. Test the real thing: *Forgot password* on the login page.
 
----
+The SMTP password is stored **encrypted** in the database (`app_settings` table); the key is the
+auto-created file `includes/.mail_secret_key` (blocked from the web and ignored by Git). If you
+delete that file you simply re-enter the password. If you move the site to another server, copy the
+key file too or re-enter the password.
 
-## 📝 Recent Fixes (this build)
+`includes/mail_config.php` is now only an optional set of defaults; anything saved on the
+Email Settings page overrides it. Reset e-mails use the bundled PHPMailer (`lib/PHPMailer/`).
 
-- **Registration now requires a profile photo.** Both patients and doctors must upload a real JPG/PNG/WEBP photo (max 3MB) when creating an account — validated server-side, stored in `uploads/avatars/`, and shown everywhere the person's avatar appears.
-- **Profile photos can be changed anytime** from `profile.php` (click the camera icon on your avatar).
-- **The 3 demo doctor accounts now have real photos** instead of initials placeholders, seeded in `telecure_db.sql`.
-- Fixed a bug where every avatar site-wide ignored the uploaded/seeded photo and always showed generated initials.
-- Fixed a variable-collision bug on `doctor_profile.php` that could show the logged-in user's avatar instead of the doctor being viewed.
-- `uploads/avatars/` must be writable by the web server (`chmod 755` is usually enough on WAMP/XAMPP; the app will also try to create it automatically).
-
----
-
-## 🔑 Demo Accounts
-
-After importing the SQL file, these accounts are ready:
-
-| Name            | Email                  | Password   | Role   |
-|-----------------|------------------------|------------|--------|
-| Dr. Sarah Johnson | sarah@telecure.com   | password   | Doctor |
-| Dr. Michael Osei  | michael@telecure.com | password   | Doctor |
-| Dr. Priya Naidoo  | priya@telecure.com   | password   | Doctor |
-
-> ⚠️ **Change these passwords** before going live!
-
----
-
-## ✅ Features Checklist
-
-| Feature                         | File(s)                          |
-|---------------------------------|----------------------------------|
-| Patient Registration            | register.php                     |
-| Doctor Registration             | register.php                     |
-| Login / Logout                  | login.php, logout.php            |
-| Password Reset                  | reset_password.php               |
-| Patient Dashboard               | dashboard.php                    |
-| Doctor Dashboard                | dashboard.php                    |
-| Find & Search Doctors           | find_doctors.php                 |
-| Doctor Public Profile           | doctor_profile.php               |
-| Star Ratings & Reviews          | doctor_profile.php               |
-| Book Appointments               | appointments.php                 |
-| Appointment Slot Picker         | api/appointments.php             |
-| Video Consultation (Jitsi)      | video.php                        |
-| Real-time Chat (AJAX poll)      | chat.php, api/messages.php       |
-| Digital Prescriptions           | prescriptions.php                |
-| Print Prescriptions             | prescriptions.php (print CSS)    |
-| Notifications System            | notifications.php                |
-| Edit Profile & Password         | profile.php                      |
-| Admin Panel                     | admin.php                        |
-| Doctor Verification             | admin.php                        |
-| Animations & Particles          | js/animations.js, css/animations.css |
-| White & Blue Theme              | css/style.css                    |
-| Fully Responsive                | All CSS files                    |
-| POPIA / Security Headers        | .htaccess                        |
-| phpMyAdmin / MySQL Storage      | telecure_db.sql + config.php     |
-
----
-
-## 🔒 Security Notes
-
-- All user input is sanitized via `sanitize()` in config.php
-- Passwords hashed with `password_hash()` (bcrypt)
-- PDO prepared statements prevent SQL injection
-- `.htaccess` blocks direct access to SQL files and includes
-- Session-based authentication on every protected page
-
----
-
-## 🎥 Video Consultation
-
-TeleCure uses **Jitsi Meet** (free, open-source) for video calls:
-- No account required
-- Works in any modern browser
-- No software download needed
-- End-to-end encrypted
-
----
-
-## 🛠️ Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| Blank page | Enable PHP error display: add `ini_set('display_errors',1);` to config.php |
-| DB connection failed | Check DB_USER and DB_PASS in config.php |
-| Parse error `=>` | Ensure PHP is 5.6+ in WAMP settings |
-| Images not showing | Check internet connection (avatars use external API) |
-| Video not working | Allow camera/mic in browser permissions |
-
----
-
-## 📞 Support
-
-Built for educational/portfolio purposes. Customize freely!
+Troubleshooting: on WAMP make sure `extension=openssl` is enabled in `php.ini`. A "certificate verify
+failed" error means PHP lacks a CA bundle: set `openssl.cafile` in `php.ini`, or as a last resort on your
+own laptop untick *Verify the mail server's security certificate* on the Email Settings page.

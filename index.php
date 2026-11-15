@@ -374,7 +374,7 @@
             
             <!-- 3. Software Designer -->
             <div class="team-card bg-gray-900 rounded-3xl overflow-hidden">
-                <img src="images/ALan.jpeg" alt="Lerato Mthembu - Software Designer" class="w-full h-64 object-cover">
+                <img src="images/Alan.jpeg" alt="Lerato Mthembu - Software Designer" class="w-full h-64 object-cover">
                 <div class="p-6">
                     <div class="font-semibold text-xl">ALAN CHAUKE</div>
                     <div class="text-[#00d4ff] text-sm">Software Designer</div>

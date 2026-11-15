@@ -8,11 +8,12 @@ if (isLoggedIn()) {
 
 $errors = [];
 $success = '';
-$role = isset($_GET['role']) ? $_GET['role'] : 'patient';
+$role = (isset($_GET['role']) && $_GET['role'] === 'doctor') ? 'doctor' : 'patient';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    requireCsrf();
     $full_name    = sanitize($_POST['full_name'] ?? '');
-    $email        = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
+    $email        = strtolower(trim($_POST['email'] ?? ''));
     $password     = $_POST['password'] ?? '';
     $confirm_pass = $_POST['confirm_password'] ?? '';
     $role         = sanitize($_POST['role'] ?? 'patient');
@@ -28,9 +29,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Validation
     if (empty($full_name)) $errors[] = 'Full name is required.';
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Valid email is required.';
-    if (strlen($password) < 8) $errors[] = 'Password must be at least 8 characters.';
+    if ($pwErr = passwordPolicyError($password)) $errors[] = $pwErr;
     if ($password !== $confirm_pass) $errors[] = 'Passwords do not match.';
-    if (!in_array($role, ['patient','doctor'])) $errors[] = 'Invalid role selected.';
+    if (!in_array($role, ['patient','doctor'], true)) $errors[] = 'Invalid role selected.';
+    if (!in_array($gender, ['', 'male', 'female', 'other'], true)) $errors[] = 'Invalid gender selected.';
+    if ($dob !== '') {
+        $d = DateTime::createFromFormat('Y-m-d', $dob);
+        if (!$d || $d->format('Y-m-d') !== $dob || $d > new DateTime('today')) $errors[] = 'Please enter a valid date of birth.';
+    }
+    if ($role === 'doctor' && ($years_exp < 0 || $years_exp > 60)) $errors[] = 'Years of experience must be between 0 and 60.';
+    if ($role === 'doctor' && $fee < 0) $errors[] = 'Consultation fee cannot be negative.';
     if ($role === 'doctor' && empty($specialization)) $errors[] = 'Specialization is required for doctors.';
     if ($role === 'doctor' && empty($license_number)) $errors[] = 'License number is required for doctors.';
 
@@ -54,14 +62,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Check email unique
         $check = $db->prepare("SELECT id FROM users WHERE email = ?");
         $check->execute([$email]);
-        if ($check->fetch()) {
-            $errors[] = 'An account with this email already exists.';
+        $licenseTaken = false;
+        if ($role === 'doctor') {
+            $lc = $db->prepare("SELECT id FROM doctor_profiles WHERE license_number = ?");
+            $lc->execute([$license_number]);
+            $licenseTaken = (bool)$lc->fetch();
+        }
+        if ($check->fetch() || $licenseTaken) {
+            $errors[] = $licenseTaken ? 'A doctor with this license number is already registered.' : 'An account with this email already exists.';
+            // Don't leave the just-uploaded photo orphaned on disk.
+            if ($photoFilename && file_exists(AVATAR_UPLOAD_DIR . $photoFilename)) {
+                @unlink(AVATAR_UPLOAD_DIR . $photoFilename);
+            }
         } else {
             $hashed = password_hash($password, PASSWORD_DEFAULT);
             $db->beginTransaction();
             try {
                 $stmt = $db->prepare("INSERT INTO users (full_name, email, password, role, phone, date_of_birth, gender, profile_photo, bio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                $stmt->execute([$full_name, $email, $hashed, $role, $phone, $dob ?: null, $gender, $photoFilename, $bio]);
+                $stmt->execute([$full_name, $email, $hashed, $role, $phone, $dob ?: null, $gender ?: null, $photoFilename, $bio]);
                 $userId = $db->lastInsertId();
 
                 if ($role === 'doctor') {
@@ -72,6 +90,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $db->commit();
 
                 // Auto-login
+                session_regenerate_id(true);
                 $_SESSION['user_id'] = $userId;
                 $_SESSION['user_role'] = $role;
                 $_SESSION['user_name'] = $full_name;
@@ -152,11 +171,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <?php if (!empty($errors)): ?>
             <div class="alert alert-error">
                 <i class="fas fa-exclamation-circle"></i>
-                <ul><?php foreach($errors as $e): ?><li><?= $e ?></li><?php endforeach; ?></ul>
+                <ul><?php foreach($errors as $err): ?><li><?= e($err) ?></li><?php endforeach; ?></ul>
             </div>
             <?php endif; ?>
 
             <form method="POST" action="register.php" id="registerForm" class="auth-form" enctype="multipart/form-data">
+                <?= csrf_field() ?>
                 <input type="hidden" name="role" id="roleInput" value="<?= htmlspecialchars($role) ?>">
 
                 <div class="form-group photo-upload-group">
@@ -188,7 +208,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="form-group">
                         <label><i class="fas fa-lock"></i> Password</label>
                         <div class="password-wrapper">
-                            <input type="password" name="password" id="password" placeholder="Min 8 characters" required>
+                            <input type="password" name="password" id="password" placeholder="8+ chars, a number &amp; a symbol" required autocomplete="new-password" data-password-rules="passwordRules">
                             <button type="button" class="toggle-pass" onclick="togglePass('password')"><i class="fas fa-eye"></i></button>
                         </div>
                     </div>
@@ -200,6 +220,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         </div>
                     </div>
                 </div>
+
+                <ul class="pw-rules" id="passwordRules" aria-live="polite"></ul>
 
                 <div class="form-row">
                     <div class="form-group">
@@ -303,23 +325,19 @@ function switchRole(role) {
     document.querySelectorAll('.role-btn').forEach(b => b.classList.remove('active'));
     document.querySelector(`[data-role="${role}"]`).classList.add('active');
     document.getElementById('doctorFields').style.display = role === 'doctor' ? 'block' : 'none';
+    // Only require the doctor fields when registering as a doctor.
+    document.querySelectorAll('#doctorFields select[name="specialization"], #doctorFields input[name="license_number"]').forEach(function (el) {
+        el.required = (role === 'doctor');
+    });
 }
+switchRole(document.getElementById('roleInput').value);
 
 function togglePass(id) {
     const inp = document.getElementById(id);
     inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 
-// Password strength indicator
-document.getElementById('password')?.addEventListener('input', function() {
-    const val = this.value;
-    let strength = 0;
-    if (val.length >= 8) strength++;
-    if (/[A-Z]/.test(val)) strength++;
-    if (/[0-9]/.test(val)) strength++;
-    if (/[^A-Za-z0-9]/.test(val)) strength++;
-    // Could add strength meter UI here
-});
 </script>
+<script src="js/password-rules.js"></script>
 </body>
 </html>

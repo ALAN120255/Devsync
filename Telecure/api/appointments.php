@@ -4,6 +4,9 @@ require_once '../includes/config.php';
 requireLogin();
 
 header('Content-Type: application/json');
+// Availability changes second by second - never let the browser or a proxy cache it.
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
 $db  = getDB();
 $uid = (int)$_SESSION['user_id'];
 $role= $_SESSION['user_role'];
@@ -16,28 +19,38 @@ switch ($action) {
     case 'slots':
         $doctorId = (int)($_GET['doctor_id'] ?? 0);
         $date     = sanitize($_GET['date'] ?? '');
-        if (!$doctorId || !$date) { echo json_encode([]); exit; }
+        $d        = DateTime::createFromFormat('Y-m-d', $date);
+        if (!$doctorId || !$d || $d->format('Y-m-d') !== $date) { echo json_encode(['server_time' => date('c'), 'slots' => []]); exit; }
 
-        $allSlots = array('08:00','08:30','09:00','09:30','10:00','10:30',
-                          '11:00','11:30','12:00','12:30','14:00','14:30',
-                          '15:00','15:30','16:00','16:30','17:00');
+        $allSlots = appointmentSlots();
 
         $booked = $db->prepare(
             "SELECT appointment_time FROM appointments
              WHERE doctor_id=? AND appointment_date=? AND status NOT IN ('cancelled')"
         );
         $booked->execute([$doctorId, $date]);
-        $bookedTimes = $booked->fetchAll(PDO::FETCH_COLUMN, 0);
+        // TIME columns come back as HH:MM:SS - normalise to HH:MM so they match our slot list.
+        $bookedTimes = array_map(function ($t) { return substr($t, 0, 5); }, $booked->fetchAll(PDO::FETCH_COLUMN, 0));
 
         $available = array();
         foreach ($allSlots as $slot) {
+            $inPast = strtotime("$date $slot") <= time();
             $available[] = array(
                 'time'      => $slot,
                 'label'     => date('g:i A', strtotime($slot)),
-                'available' => !in_array($slot, $bookedTimes),
+                'available' => !$inPast && !in_array($slot, $bookedTimes, true),
             );
         }
-        echo json_encode($available);
+        // server_time lets the page show the doctor's real clock instead of the visitor's device clock.
+        echo json_encode(['server_time' => date('c'), 'now_label' => date('g:i:s A'), 'slots' => $available]);
+        break;
+
+    // ── Cheap "has anything changed?" fingerprint of my appointments (polled by appointments.php) ──
+    case 'signature':
+        $col = $role === 'doctor' ? 'doctor_id' : 'patient_id';
+        $q = $db->prepare("SELECT id, status, appointment_date, appointment_time FROM appointments WHERE $col=? ORDER BY id");
+        $q->execute([$uid]);
+        echo json_encode(['sig' => md5(json_encode($q->fetchAll(PDO::FETCH_NUM))), 'server_time' => date('c')]);
         break;
 
     // ── Get upcoming appointments count ──────────────────────────────

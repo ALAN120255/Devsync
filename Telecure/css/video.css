@@ -173,3 +173,8 @@
   .video-landing { grid-template-columns: 1fr; }
   .video-features-grid { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* In-call mini chat bubbles */
+.mini-msg { max-width: 85%; padding: 6px 10px; border-radius: 10px; margin: 4px 0; font-size: 0.82rem; word-wrap: break-word; }
+.mini-msg.mine { background: var(--primary, #1565C0); color: #fff; margin-left: auto; }
+.mini-msg.theirs { background: #eef2f7; color: #1f2937; margin-right: auto; }

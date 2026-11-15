@@ -24,11 +24,18 @@ if (isset($_GET['delete'])) {
     exit;
 }
 
+// Whitelisted filter + bound parameter (the old query referenced a non-existent alias "n"
+// and interpolated user input straight into the SQL).
 $filter = sanitize($_GET['filter'] ?? 'all');
-$filterSQL = $filter !== 'all' ? "AND n.type = '$filter'" : '';
+if (!in_array($filter, ['all', 'appointment', 'message', 'prescription', 'general'], true)) $filter = 'all';
 
-$stmt = $db->prepare("SELECT * FROM notifications WHERE user_id = ? $filterSQL ORDER BY created_at DESC");
-$stmt->execute([$user['id']]);
+if ($filter !== 'all') {
+    $stmt = $db->prepare("SELECT * FROM notifications WHERE user_id = ? AND type = ? ORDER BY created_at DESC, id DESC");
+    $stmt->execute([$user['id'], $filter]);
+} else {
+    $stmt = $db->prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC");
+    $stmt->execute([$user['id']]);
+}
 $notifications = $stmt->fetchAll();
 ?>
 <!DOCTYPE html>

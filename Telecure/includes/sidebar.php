@@ -69,9 +69,12 @@ $unreadNotifCount = getUnreadNotifications($user['id']);
             <i class="fas fa-search"></i> <span>Find Doctors</span>
         </a>
         <?php endif; ?>
-        <?php if ($role === 'doctor'): ?>
+        <?php if (isAdmin($user)): ?>
         <a href="admin.php" class="nav-item <?= $currentPage === 'admin.php' ? 'active' : '' ?>">
             <i class="fas fa-shield-alt"></i> <span>Admin Panel</span>
+        </a>
+        <a href="admin_email.php" class="nav-item <?= $currentPage === 'admin_email.php' ? 'active' : '' ?>">
+            <i class="fas fa-envelope-open-text"></i> <span>Email Settings</span>
         </a>
         <?php endif; ?>
         <a href="notifications.php" class="nav-item <?= $currentPage === 'notifications.php' ? 'active' : '' ?>">
